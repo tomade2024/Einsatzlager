@@ -24,6 +24,8 @@ LAGER = [
     "Textillager",
 ]
 
+ROLLEN = ["Admin", "Lagerist", "Vertrieb"]
+
 
 # -------------------------------------------------
 # Hilfsfunktionen
@@ -44,29 +46,124 @@ def html_escape(text):
     )
 
 
+def row_to_dict(row):
+    return dict(row) if row is not None else None
+
+
+def interner_user_eingeloggt():
+    return st.session_state.get("internal_logged_in", False)
+
+
+def kunde_eingeloggt():
+    return "kunde" in st.session_state
+
+
+def current_role():
+    if not interner_user_eingeloggt():
+        return None
+    return st.session_state.get("internal_user", {}).get("rolle")
+
+
+def require_role(*rollen):
+    if not interner_user_eingeloggt():
+        st.error("Bitte zuerst als interner Benutzer einloggen.")
+        st.stop()
+    if current_role() not in rollen:
+        st.error("Keine Berechtigung für diesen Bereich.")
+        st.stop()
+
+
+def kunde_name(kunde_row):
+    firmenname = kunde_row["firmenname"] or ""
+    vorname = kunde_row["vorname"] or ""
+    nachname = kunde_row["nachname"] or ""
+
+    if firmenname.strip():
+        return f"{firmenname} / {vorname} {nachname}".strip()
+    return f"{vorname} {nachname}".strip()
+
+
+def kunde_lieferadresse(kunde_row):
+    teile = []
+    if kunde_row["firmenname"]:
+        teile.append(kunde_row["firmenname"])
+    teile.append(f"{kunde_row['vorname']} {kunde_row['nachname']}".strip())
+    teile.append(kunde_row["strasse"])
+    teile.append(f"{kunde_row['plz']} {kunde_row['ort']}")
+    return "\n".join(teile)
+
+
 def warenkorb_zusammenfassen(warenkorb):
     zusammen = {}
     for item in warenkorb:
-        key = item["artikel_id"]
+        key = (
+            item["artikel_id"],
+            item.get("bestell_typ", "Stück"),
+        )
         if key not in zusammen:
             zusammen[key] = item.copy()
         else:
             zusammen[key]["menge_stueck"] += item["menge_stueck"]
+            zusammen[key]["eingabe_menge"] = (
+                float(zusammen[key].get("eingabe_menge", 0)) +
+                float(item.get("eingabe_menge", 0))
+            )
     return list(zusammen.values())
 
 
-def admin_ist_eingeloggt():
-    return st.session_state.get("admin_logged_in", False)
+def suche_artikel_df(df: pd.DataFrame, suchtext: str):
+    if df.empty:
+        return df
+
+    suchtext = (suchtext or "").strip().lower()
+    if not suchtext:
+        return df
+
+    return df[
+        df["artikelnummer"].astype(str).str.lower().str.contains(suchtext, na=False)
+        | df["name"].astype(str).str.lower().str.contains(suchtext, na=False)
+        | df["lager"].astype(str).str.lower().str.contains(suchtext, na=False)
+    ].copy()
 
 
-def kunde_ist_eingeloggt():
-    return "kunde" in st.session_state
+def build_kommissionierliste_text(bestellung, positionen):
+    lines = []
+    lines.append("KOMMISSIONIERLISTE")
+    lines.append("")
+    lines.append(f"Bestellnummer: {bestellung['bestellnummer']}")
+    lines.append(f"Datum: {bestellung['datum']}")
+    lines.append(f"Uhrzeit: {bestellung['uhrzeit']}")
+    lines.append(f"Kunde: {bestellung['kunde_name']}")
+    lines.append("")
+    lines.append("Artikel:")
+    lines.append("")
+
+    for _, pos in positionen.iterrows():
+        lines.append(
+            f"- {pos['artikelnummer']} | {pos['name']} | Lager: {pos['lager']} | Menge: {pos['menge_stueck']} Stück"
+        )
+
+    return "\n".join(lines)
 
 
-def require_admin():
-    if not admin_ist_eingeloggt():
-        st.error("Dieser Bereich ist nur für Admins zugänglich.")
-        st.stop()
+def build_lieferschein_text(bestellung, positionen):
+    lines = []
+    lines.append("LIEFERSCHEIN")
+    lines.append("")
+    lines.append(f"Bestellnummer: {bestellung['bestellnummer']}")
+    lines.append(f"Lieferadresse: {bestellung['lieferadresse']}")
+    lines.append(f"Datum: {bestellung['datum']}")
+    lines.append(f"Uhrzeit: {bestellung['uhrzeit']}")
+    lines.append("")
+    lines.append("Bestellte Materialien:")
+    lines.append("")
+
+    for _, pos in positionen.iterrows():
+        lines.append(
+            f"- {pos['artikelnummer']} | {pos['name']} | Menge: {pos['menge_stueck']} Stück"
+        )
+
+    return "\n".join(lines)
 
 
 # -------------------------------------------------
@@ -76,6 +173,17 @@ def get_connection():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_column_exists(table_name: str, column_name: str, column_sql: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table_name})")
+    columns = [row["name"] for row in cur.fetchall()]
+    if column_name not in columns:
+        cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+        conn.commit()
+    conn.close()
 
 
 def init_db():
@@ -90,6 +198,7 @@ def init_db():
             lager TEXT NOT NULL,
             verpackung_typ TEXT NOT NULL,
             inhalt_pro_pack INTEGER NOT NULL DEFAULT 10,
+            packs_pro_palette INTEGER NOT NULL DEFAULT 10,
             bestand_stueck INTEGER NOT NULL DEFAULT 0
         )
     """)
@@ -99,6 +208,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             artikel_id INTEGER NOT NULL,
             menge_stueck INTEGER NOT NULL,
+            buchungs_typ TEXT,
+            eingabe_menge REAL,
             datum TEXT NOT NULL,
             FOREIGN KEY (artikel_id) REFERENCES artikel(id)
         )
@@ -159,60 +270,84 @@ def init_db():
     """)
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS admin_users (
+        CREATE TABLE IF NOT EXISTS internal_users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             passwort_hash TEXT NOT NULL,
+            rolle TEXT NOT NULL,
             erstellt_am TEXT NOT NULL,
             ist_aktiv INTEGER NOT NULL DEFAULT 1
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS artikel_alternativen (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            artikel_id INTEGER NOT NULL,
+            alternativ_artikel_id INTEGER NOT NULL,
+            UNIQUE(artikel_id, alternativ_artikel_id),
+            FOREIGN KEY (artikel_id) REFERENCES artikel(id),
+            FOREIGN KEY (alternativ_artikel_id) REFERENCES artikel(id)
+        )
+    """)
+
     conn.commit()
+    conn.close()
+
+    # Migration für ältere Datenbanken
+    ensure_column_exists("artikel", "packs_pro_palette", "INTEGER NOT NULL DEFAULT 10")
+    ensure_column_exists("wareneingang", "buchungs_typ", "TEXT")
+    ensure_column_exists("wareneingang", "eingabe_menge", "REAL")
+
+    conn = get_connection()
+    cur = conn.cursor()
 
     cur.execute("SELECT COUNT(*) AS anzahl FROM artikel")
     result = cur.fetchone()
     if result["anzahl"] == 0:
         demo_artikel = [
-            ("MED-1001", "Verbandskasten", "Medizinlager", "Pack", 10, 50),
-            ("VER-1002", "Einweghandschuhe", "Verbrauchslager", "Pack", 10, 120),
-            ("MAT-1003", "Schrauben Set", "Materiallager", "Pack", 10, 80),
-            ("TEC-1004", "Netzteil", "Techniklager", "Stück", 1, 15),
-            ("MOE-1005", "Bürostuhl", "Möbellager", "Stück", 1, 8),
-            ("LEB-1006", "Mineralwasser", "Lebensmittellager", "Pack", 10, 60),
-            ("TEX-1007", "Arbeitshose", "Textillager", "Stück", 1, 20),
+            ("MED-1001", "Verbandskasten", "Medizinlager", "Pack", 10, 12, 50),
+            ("VER-1002", "Einweghandschuhe", "Verbrauchslager", "Pack", 10, 20, 120),
+            ("MAT-1003", "Schrauben Set", "Materiallager", "Pack", 10, 30, 80),
+            ("TEC-1004", "Netzteil", "Techniklager", "Stück", 1, 50, 15),
+            ("MOE-1005", "Bürostuhl", "Möbellager", "Stück", 1, 8, 8),
+            ("LEB-1006", "Mineralwasser", "Lebensmittellager", "Pack", 10, 48, 60),
+            ("TEX-1007", "Arbeitshose", "Textillager", "Stück", 1, 25, 20),
         ]
         cur.executemany("""
             INSERT INTO artikel
-            (artikelnummer, name, lager, verpackung_typ, inhalt_pro_pack, bestand_stueck)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (artikelnummer, name, lager, verpackung_typ, inhalt_pro_pack, packs_pro_palette, bestand_stueck)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, demo_artikel)
         conn.commit()
 
-    cur.execute("SELECT COUNT(*) AS anzahl FROM admin_users")
-    admin_count = cur.fetchone()["anzahl"]
-    if admin_count == 0:
-        cur.execute("""
-            INSERT INTO admin_users (username, passwort_hash, erstellt_am, ist_aktiv)
-            VALUES (?, ?, ?, 1)
-        """, (
-            "admin",
-            hash_password("admin123"),
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        ))
+    cur.execute("SELECT COUNT(*) AS anzahl FROM internal_users")
+    user_count = cur.fetchone()["anzahl"]
+    if user_count == 0:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        defaults = [
+            ("admin", hash_password("admin123"), "Admin", now_str, 1),
+            ("lager", hash_password("lager123"), "Lagerist", now_str, 1),
+            ("vertrieb", hash_password("vertrieb123"), "Vertrieb", now_str, 1),
+        ]
+        cur.executemany("""
+            INSERT INTO internal_users (username, passwort_hash, rolle, erstellt_am, ist_aktiv)
+            VALUES (?, ?, ?, ?, ?)
+        """, defaults)
         conn.commit()
 
     conn.close()
 
 
 # -------------------------------------------------
-# Admin
+# Interne Benutzer / Rollen
 # -------------------------------------------------
-def admin_login(username: str, passwort: str):
+def internal_login(username: str, passwort: str):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT * FROM admin_users
+        SELECT *
+        FROM internal_users
         WHERE username = ? AND passwort_hash = ? AND ist_aktiv = 1
     """, (username.strip(), hash_password(passwort)))
     row = cur.fetchone()
@@ -220,82 +355,48 @@ def admin_login(username: str, passwort: str):
     return row
 
 
-def admin_passwort_aendern(admin_id: int, neues_passwort: str):
+def hole_interne_benutzer():
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT id, username, rolle, erstellt_am, ist_aktiv
+        FROM internal_users
+        ORDER BY rolle, username
+    """, conn)
+    conn.close()
+    return df
+
+
+def internen_benutzer_anlegen(username: str, passwort: str, rolle: str):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        UPDATE admin_users
-        SET passwort_hash = ?
-        WHERE id = ?
-    """, (hash_password(neues_passwort), admin_id))
+        INSERT INTO internal_users (username, passwort_hash, rolle, erstellt_am, ist_aktiv)
+        VALUES (?, ?, ?, ?, 1)
+    """, (
+        username.strip(),
+        hash_password(passwort),
+        rolle,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    ))
     conn.commit()
     conn.close()
 
 
-def zeige_admin_login():
-    st.subheader("Admin-Anmeldung")
-
-    with st.form("admin_login_form"):
-        username = st.text_input("Admin Benutzername")
-        passwort = st.text_input("Admin Passwort", type="password")
-        senden = st.form_submit_button("Als Admin einloggen")
-
-    if senden:
-        admin = admin_login(username, passwort)
-        if admin:
-            st.session_state.admin_logged_in = True
-            st.session_state.admin_user = dict(admin)
-            st.success("Admin-Login erfolgreich.")
-            st.rerun()
-        else:
-            st.error("Ungültiger Admin-Benutzername oder Passwort.")
-
-
-def zeige_admin_einstellungen():
-    require_admin()
-    st.subheader("Admin-Einstellungen")
-
-    admin = st.session_state.get("admin_user")
-    st.write(f"**Eingeloggt als:** {admin['username']}")
-
-    with st.form("admin_passwort_form"):
-        neues_passwort = st.text_input("Neues Passwort", type="password")
-        neues_passwort2 = st.text_input("Neues Passwort wiederholen", type="password")
-        speichern = st.form_submit_button("Admin-Passwort ändern")
-
-    if speichern:
-        if not neues_passwort:
-            st.error("Bitte ein neues Passwort eingeben.")
-        elif neues_passwort != neues_passwort2:
-            st.error("Die Passwörter stimmen nicht überein.")
-        else:
-            admin_passwort_aendern(admin["id"], neues_passwort)
-            st.success("Admin-Passwort wurde geändert.")
+def internes_passwort_aendern(user_id: int, neues_passwort: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE internal_users
+        SET passwort_hash = ?
+        WHERE id = ?
+    """, (hash_password(neues_passwort), user_id))
+    conn.commit()
+    conn.close()
 
 
 # -------------------------------------------------
 # Kunden
 # -------------------------------------------------
-def kundenname_komplett(kunde_row):
-    firmenname = kunde_row["firmenname"] or ""
-    vorname = kunde_row["vorname"] or ""
-    nachname = kunde_row["nachname"] or ""
-
-    if firmenname.strip():
-        return f"{firmenname} / {vorname} {nachname}".strip()
-    return f"{vorname} {nachname}".strip()
-
-
-def kunden_lieferadresse_text(kunde_row):
-    teile = []
-    if kunde_row["firmenname"]:
-        teile.append(kunde_row["firmenname"])
-    teile.append(f"{kunde_row['vorname']} {kunde_row['nachname']}".strip())
-    teile.append(kunde_row["strasse"])
-    teile.append(f"{kunde_row['plz']} {kunde_row['ort']}")
-    return "\n".join(teile)
-
-
 def kunde_registrieren(
     firmenname,
     anrede,
@@ -348,11 +449,12 @@ def kunde_registrieren(
     return kunden_nr
 
 
-def kunde_login(email, passwort):
+def kunde_login(email: str, passwort: str):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT * FROM kunden
+        SELECT *
+        FROM kunden
         WHERE lower(email) = ? AND passwort_hash = ? AND ist_aktiv = 1
     """, (email.strip().lower(), hash_password(passwort)))
     row = cur.fetchone()
@@ -411,7 +513,7 @@ def setze_lagerfreigaben_fuer_kunde(kunden_id: int, erlaubte_lager: list):
 
 
 # -------------------------------------------------
-# Artikel / Lager
+# Artikel / Lager / Palette / Alternativen
 # -------------------------------------------------
 def artikel_df():
     conn = get_connection()
@@ -421,40 +523,224 @@ def artikel_df():
     if not df.empty:
         df["bestand_pack"] = df["bestand_stueck"] / df["inhalt_pro_pack"]
         df["bestand_pack"] = df["bestand_pack"].round(2)
+        df["stueck_pro_palette"] = df["inhalt_pro_pack"] * df["packs_pro_palette"]
+        df["bestand_palette"] = df["bestand_stueck"] / df["stueck_pro_palette"]
+        df["bestand_palette"] = df["bestand_palette"].round(2)
 
     return df
 
 
-def artikel_speichern(artikelnummer, name, lager, verpackung_typ, inhalt_pro_pack, bestand_stueck):
+def hole_artikel_by_id(artikel_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM artikel WHERE id = ?", (artikel_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def artikel_speichern(
+    artikelnummer,
+    name,
+    lager,
+    verpackung_typ,
+    inhalt_pro_pack,
+    packs_pro_palette,
+    bestand_stueck
+):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO artikel
-        (artikelnummer, name, lager, verpackung_typ, inhalt_pro_pack, bestand_stueck)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (artikelnummer, name, lager, verpackung_typ, inhalt_pro_pack, packs_pro_palette, bestand_stueck)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
         artikelnummer.strip(),
         name.strip(),
         lager,
         verpackung_typ,
         int(inhalt_pro_pack),
+        int(packs_pro_palette),
         int(bestand_stueck),
     ))
     conn.commit()
     conn.close()
 
 
-def wareneingang_buchen(artikel_id: int, menge_stueck: int):
+def artikel_aktualisieren(
+    artikel_id,
+    artikelnummer,
+    name,
+    lager,
+    verpackung_typ,
+    inhalt_pro_pack,
+    packs_pro_palette,
+    bestand_stueck
+):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(
-        "UPDATE artikel SET bestand_stueck = bestand_stueck + ? WHERE id = ?",
-        (menge_stueck, artikel_id),
-    )
-    cur.execute(
-        "INSERT INTO wareneingang (artikel_id, menge_stueck, datum) VALUES (?, ?, ?)",
-        (artikel_id, menge_stueck, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-    )
+    cur.execute("""
+        UPDATE artikel
+        SET artikelnummer = ?,
+            name = ?,
+            lager = ?,
+            verpackung_typ = ?,
+            inhalt_pro_pack = ?,
+            packs_pro_palette = ?,
+            bestand_stueck = ?
+        WHERE id = ?
+    """, (
+        artikelnummer.strip(),
+        name.strip(),
+        lager,
+        verpackung_typ,
+        int(inhalt_pro_pack),
+        int(packs_pro_palette),
+        int(bestand_stueck),
+        int(artikel_id),
+    ))
+    conn.commit()
+    conn.close()
+
+
+def artikel_loeschen(artikel_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) AS anzahl FROM bestellpositionen WHERE artikel_id = ?", (artikel_id,))
+    bestellungen = cur.fetchone()["anzahl"]
+
+    cur.execute("SELECT COUNT(*) AS anzahl FROM wareneingang WHERE artikel_id = ?", (artikel_id,))
+    wareneingaenge = cur.fetchone()["anzahl"]
+
+    cur.execute("""
+        SELECT COUNT(*) AS anzahl
+        FROM artikel_alternativen
+        WHERE artikel_id = ? OR alternativ_artikel_id = ?
+    """, (artikel_id, artikel_id))
+    alternativen = cur.fetchone()["anzahl"]
+
+    if bestellungen > 0 or wareneingaenge > 0 or alternativen > 0:
+        conn.close()
+        raise ValueError(
+            "Artikel kann nicht gelöscht werden, weil bereits Wareneingänge, Bestellungen oder Alternativzuordnungen dazu existieren."
+        )
+
+    cur.execute("DELETE FROM artikel WHERE id = ?", (artikel_id,))
+    conn.commit()
+    conn.close()
+
+
+def menge_zu_stueck(artikel_row, buchungs_typ: str, eingabe_menge: float) -> int:
+    inhalt_pro_pack = int(artikel_row["inhalt_pro_pack"])
+    packs_pro_palette = int(artikel_row["packs_pro_palette"])
+
+    if buchungs_typ == "Stück":
+        return int(eingabe_menge)
+    if buchungs_typ == "Pack":
+        return int(eingabe_menge * inhalt_pro_pack)
+    if buchungs_typ == "Palette":
+        return int(eingabe_menge * inhalt_pro_pack * packs_pro_palette)
+    raise ValueError("Ungültiger Buchungstyp.")
+
+
+def bestellmenge_zu_stueck(artikel_row, bestell_typ: str, eingabe_menge: float) -> int:
+    inhalt_pro_pack = int(artikel_row["inhalt_pro_pack"])
+    packs_pro_palette = int(artikel_row["packs_pro_palette"])
+
+    if bestell_typ == "Stück":
+        return int(eingabe_menge)
+    if bestell_typ == "Pack":
+        return int(eingabe_menge * inhalt_pro_pack)
+    if bestell_typ == "Palette":
+        return int(eingabe_menge * inhalt_pro_pack * packs_pro_palette)
+
+    raise ValueError("Ungültiger Bestelltyp.")
+
+
+def wareneingang_buchen(artikel_id: int, buchungs_typ: str, eingabe_menge: float):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM artikel WHERE id = ?", (artikel_id,))
+    artikel = cur.fetchone()
+
+    if artikel is None:
+        conn.close()
+        raise ValueError("Artikel wurde nicht gefunden.")
+
+    menge_stueck = menge_zu_stueck(artikel, buchungs_typ, eingabe_menge)
+
+    cur.execute("""
+        UPDATE artikel
+        SET bestand_stueck = bestand_stueck + ?
+        WHERE id = ?
+    """, (menge_stueck, artikel_id))
+
+    cur.execute("""
+        INSERT INTO wareneingang (artikel_id, menge_stueck, buchungs_typ, eingabe_menge, datum)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        artikel_id,
+        menge_stueck,
+        buchungs_typ,
+        float(eingabe_menge),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def hole_artikel_alternativen_ids(artikel_id: int):
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT alternativ_artikel_id
+        FROM artikel_alternativen
+        WHERE artikel_id = ?
+        ORDER BY alternativ_artikel_id
+    """, conn, params=(artikel_id,))
+    conn.close()
+
+    if df.empty:
+        return []
+
+    return df["alternativ_artikel_id"].tolist()
+
+
+def hole_artikel_alternativen_df(artikel_id: int):
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT a.*
+        FROM artikel_alternativen aa
+        JOIN artikel a ON a.id = aa.alternativ_artikel_id
+        WHERE aa.artikel_id = ?
+        ORDER BY a.name
+    """, conn, params=(artikel_id,))
+    conn.close()
+
+    if not df.empty:
+        df["bestand_pack"] = df["bestand_stueck"] / df["inhalt_pro_pack"]
+        df["bestand_pack"] = df["bestand_pack"].round(2)
+        df["stueck_pro_palette"] = df["inhalt_pro_pack"] * df["packs_pro_palette"]
+        df["bestand_palette"] = df["bestand_stueck"] / df["stueck_pro_palette"]
+        df["bestand_palette"] = df["bestand_palette"].round(2)
+
+    return df
+
+
+def setze_artikel_alternativen(artikel_id: int, alternative_ids: list):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("DELETE FROM artikel_alternativen WHERE artikel_id = ?", (artikel_id,))
+
+    for alt_id in alternative_ids:
+        if int(alt_id) != int(artikel_id):
+            cur.execute("""
+                INSERT OR IGNORE INTO artikel_alternativen (artikel_id, alternativ_artikel_id)
+                VALUES (?, ?)
+            """, (int(artikel_id), int(alt_id)))
+
     conn.commit()
     conn.close()
 
@@ -462,7 +748,7 @@ def wareneingang_buchen(artikel_id: int, menge_stueck: int):
 # -------------------------------------------------
 # Bestellungen
 # -------------------------------------------------
-def bestellung_speichern(kunden_id: int, kunde_name: str, lieferadresse: str, warenkorb: list):
+def bestellung_speichern(kunden_id: int, kunde_name_text: str, lieferadresse: str, warenkorb: list):
     jetzt = datetime.now()
     bestellnummer = f"B-{jetzt.strftime('%Y%m%d%H%M%S')}"
 
@@ -485,7 +771,9 @@ def bestellung_speichern(kunden_id: int, kunde_name: str, lieferadresse: str, wa
 
         if artikel["bestand_stueck"] < pos["menge_stueck"]:
             conn.close()
-            raise ValueError(f"Zu wenig Bestand für {pos['name']}. Verfügbar: {artikel['bestand_stueck']} Stück.")
+            raise ValueError(
+                f"Zu wenig Bestand für {pos['name']}. Verfügbar: {artikel['bestand_stueck']} Stück."
+            )
 
     cur.execute("""
         INSERT INTO bestellungen (
@@ -495,7 +783,7 @@ def bestellung_speichern(kunden_id: int, kunde_name: str, lieferadresse: str, wa
     """, (
         bestellnummer,
         kunden_id,
-        kunde_name,
+        kunde_name_text,
         lieferadresse,
         jetzt.strftime("%d.%m.%Y"),
         jetzt.strftime("%H:%M:%S"),
@@ -539,7 +827,8 @@ def hole_bestellpositionen(bestell_id: int):
             a.name,
             a.lager,
             a.verpackung_typ,
-            a.inhalt_pro_pack
+            a.inhalt_pro_pack,
+            a.packs_pro_palette
         FROM bestellpositionen bp
         JOIN artikel a ON a.id = bp.artikel_id
         WHERE bp.bestellung_id = ?
@@ -552,46 +841,6 @@ def hole_bestellpositionen(bestell_id: int):
 # -------------------------------------------------
 # PDF / Druck
 # -------------------------------------------------
-def build_kommissionierliste_text(bestellung, positionen):
-    lines = []
-    lines.append("KOMMISSIONIERLISTE")
-    lines.append("")
-    lines.append(f"Bestellnummer: {bestellung['bestellnummer']}")
-    lines.append(f"Datum: {bestellung['datum']}")
-    lines.append(f"Uhrzeit: {bestellung['uhrzeit']}")
-    lines.append(f"Kunde: {bestellung['kunde_name']}")
-    lines.append("")
-    lines.append("Artikel:")
-    lines.append("")
-
-    for _, pos in positionen.iterrows():
-        lines.append(
-            f"- {pos['artikelnummer']} | {pos['name']} | Lager: {pos['lager']} | Menge: {pos['menge_stueck']} Stück"
-        )
-
-    return "\n".join(lines)
-
-
-def build_lieferschein_text(bestellung, positionen):
-    lines = []
-    lines.append("LIEFERSCHEIN")
-    lines.append("")
-    lines.append(f"Bestellnummer: {bestellung['bestellnummer']}")
-    lines.append(f"Lieferadresse: {bestellung['lieferadresse']}")
-    lines.append(f"Datum: {bestellung['datum']}")
-    lines.append(f"Uhrzeit: {bestellung['uhrzeit']}")
-    lines.append("")
-    lines.append("Bestellte Materialien:")
-    lines.append("")
-
-    for _, pos in positionen.iterrows():
-        lines.append(
-            f"- {pos['artikelnummer']} | {pos['name']} | Menge: {pos['menge_stueck']} Stück"
-        )
-
-    return "\n".join(lines)
-
-
 def render_print_button(title: str, text_content: str, button_label: str = "Drucken"):
     safe_title = html_escape(title)
     safe_content = html_escape(text_content).replace("\n", "<br>")
@@ -791,74 +1040,106 @@ def generate_pdf_kommissionierliste(bestellung, positionen):
 
 
 # -------------------------------------------------
-# UI
+# Login Views
 # -------------------------------------------------
-def zeige_kunden_login_registrierung():
-    st.subheader("Kundenkonto")
+def zeige_start_login():
+    st.title("📦 Lagerwirtschaft")
+    st.write("Bitte zuerst einloggen.")
 
-    tab1, tab2 = st.tabs(["Login", "Registrierung"])
+    tab1, tab2 = st.tabs(["Interner Login", "Kunden Login / Registrierung"])
 
     with tab1:
-        with st.form("login_form"):
-            email = st.text_input("E-Mail")
+        st.subheader("Interner Benutzer Login")
+        with st.form("internal_login_form"):
+            username = st.text_input("Benutzername")
             passwort = st.text_input("Passwort", type="password")
-            login = st.form_submit_button("Einloggen")
+            senden = st.form_submit_button("Einloggen")
 
-        if login:
-            kunde = kunde_login(email, passwort)
-            if kunde:
-                st.session_state.kunde = dict(kunde)
+        if senden:
+            user = internal_login(username, passwort)
+            if user:
+                st.session_state.internal_logged_in = True
+                st.session_state.internal_user = row_to_dict(user)
+                st.session_state.pop("kunde", None)
                 st.session_state.warenkorb = []
-                st.success("Login erfolgreich.")
+                st.success("Interner Login erfolgreich.")
                 st.rerun()
             else:
-                st.error("Ungültige E-Mail oder Passwort.")
+                st.error("Ungültiger Benutzername oder Passwort.")
 
     with tab2:
-        with st.form("register_form"):
-            firmenname = st.text_input("Firmenname")
-            anrede = st.selectbox("Anrede", ["", "Herr", "Frau", "Divers"])
-            vorname = st.text_input("Vorname")
-            nachname = st.text_input("Nachname")
-            email = st.text_input("E-Mail")
-            telefon = st.text_input("Telefon")
-            strasse = st.text_input("Straße und Hausnummer")
-            plz = st.text_input("PLZ")
-            ort = st.text_input("Ort")
-            passwort = st.text_input("Passwort", type="password")
-            passwort2 = st.text_input("Passwort wiederholen", type="password")
-            registrieren = st.form_submit_button("Registrieren")
+        tab_login, tab_register = st.tabs(["Kunden Login", "Registrierung"])
 
-        if registrieren:
-            if not vorname.strip() or not nachname.strip() or not email.strip():
-                st.error("Bitte Vorname, Nachname und E-Mail ausfüllen.")
-            elif not strasse.strip() or not plz.strip() or not ort.strip():
-                st.error("Bitte vollständige Adresse ausfüllen.")
-            elif not passwort:
-                st.error("Bitte ein Passwort vergeben.")
-            elif passwort != passwort2:
-                st.error("Die Passwörter stimmen nicht überein.")
-            else:
-                try:
-                    kunden_nr = kunde_registrieren(
-                        firmenname, anrede, vorname, nachname, email, telefon,
-                        strasse, plz, ort, passwort
-                    )
-                    st.success(f"Registrierung erfolgreich. Kundennummer: {kunden_nr}")
-                except sqlite3.IntegrityError:
-                    st.error("Diese E-Mail ist bereits registriert.")
+        with tab_login:
+            with st.form("customer_login_form"):
+                email = st.text_input("E-Mail")
+                passwort = st.text_input("Passwort", type="password")
+                senden = st.form_submit_button("Einloggen")
+
+            if senden:
+                kunde = kunde_login(email, passwort)
+                if kunde:
+                    st.session_state.kunde = row_to_dict(kunde)
+                    st.session_state.internal_logged_in = False
+                    st.session_state.pop("internal_user", None)
+                    st.session_state.warenkorb = []
+                    st.success("Kundenlogin erfolgreich.")
+                    st.rerun()
+                else:
+                    st.error("Ungültige E-Mail oder Passwort.")
+
+        with tab_register:
+            with st.form("register_form"):
+                firmenname = st.text_input("Firmenname")
+                anrede = st.selectbox("Anrede", ["", "Herr", "Frau", "Divers"])
+                vorname = st.text_input("Vorname")
+                nachname = st.text_input("Nachname")
+                email = st.text_input("E-Mail")
+                telefon = st.text_input("Telefon")
+                strasse = st.text_input("Straße und Hausnummer")
+                plz = st.text_input("PLZ")
+                ort = st.text_input("Ort")
+                passwort = st.text_input("Passwort", type="password")
+                passwort2 = st.text_input("Passwort wiederholen", type="password")
+                registrieren = st.form_submit_button("Registrieren")
+
+            if registrieren:
+                if not vorname.strip() or not nachname.strip() or not email.strip():
+                    st.error("Bitte Vorname, Nachname und E-Mail ausfüllen.")
+                elif not strasse.strip() or not plz.strip() or not ort.strip():
+                    st.error("Bitte vollständige Adresse ausfüllen.")
+                elif not passwort:
+                    st.error("Bitte ein Passwort vergeben.")
+                elif passwort != passwort2:
+                    st.error("Die Passwörter stimmen nicht überein.")
+                else:
+                    try:
+                        kunden_nr = kunde_registrieren(
+                            firmenname, anrede, vorname, nachname, email, telefon,
+                            strasse, plz, ort, passwort
+                        )
+                        st.success(f"Registrierung erfolgreich. Kundennummer: {kunden_nr}")
+                    except sqlite3.IntegrityError:
+                        st.error("Diese E-Mail ist bereits registriert.")
 
 
+# -------------------------------------------------
+# Interne Bereiche
+# -------------------------------------------------
 def zeige_lagerbestand():
+    require_role("Admin", "Lagerist", "Vertrieb")
     st.subheader("Lagerbestand")
+
     df = artikel_df()
+    suchtext = st.text_input("Artikel suchen", placeholder="Artikelnummer, Name oder Lager")
+    df = suche_artikel_df(df, suchtext)
 
     lager_filter = st.selectbox("Unterlager filtern", ["Alle"] + LAGER)
     if lager_filter != "Alle":
         df = df[df["lager"] == lager_filter]
 
     if df.empty:
-        st.info("Keine Artikel vorhanden.")
+        st.info("Keine Artikel gefunden.")
         return
 
     anzeigen = df[[
@@ -867,8 +1148,10 @@ def zeige_lagerbestand():
         "lager",
         "verpackung_typ",
         "inhalt_pro_pack",
+        "packs_pro_palette",
         "bestand_stueck",
-        "bestand_pack"
+        "bestand_pack",
+        "bestand_palette",
     ]].copy()
 
     anzeigen.columns = [
@@ -876,16 +1159,18 @@ def zeige_lagerbestand():
         "Bezeichnung",
         "Lager",
         "Verpackung",
-        "Inhalt pro Pack",
+        "Stück pro Pack",
+        "Pack pro Palette",
         "Bestand Stück",
-        "Bestand Pack"
+        "Bestand Pack",
+        "Bestand Palette",
     ]
 
     st.dataframe(anzeigen, use_container_width=True)
 
 
 def zeige_wareneingang():
-    require_admin()
+    require_role("Admin", "Lagerist")
     st.subheader("Wareneingang buchen")
 
     df = artikel_df()
@@ -894,29 +1179,49 @@ def zeige_wareneingang():
         return
 
     artikel_map = {
-        f"{row['artikelnummer']} | {row['name']} | {row['lager']}": int(row["id"])
+        (
+            f"{row['artikelnummer']} | {row['name']} | "
+            f"{row['lager']} | {row['inhalt_pro_pack']} Stk/Pack | "
+            f"{row['packs_pro_palette']} Pack/Palette"
+        ): row
         for _, row in df.iterrows()
     }
 
     auswahl = st.selectbox("Artikel", list(artikel_map.keys()))
-    menge = st.number_input("Anzahl Stück", min_value=1, step=1)
+    artikel = artikel_map[auswahl]
+
+    st.info(
+        f"Artikel: {artikel['name']} | Stück pro Pack: {artikel['inhalt_pro_pack']} | "
+        f"Pack pro Palette: {artikel['packs_pro_palette']}"
+    )
+
+    buchungs_typ = st.selectbox("Wareneingang buchen als", ["Stück", "Pack", "Palette"])
+
+    if buchungs_typ == "Palette":
+        eingabe_menge = st.number_input("Anzahl Paletten", min_value=1.0, step=1.0, value=1.0)
+    else:
+        eingabe_menge = st.number_input(f"Anzahl {buchungs_typ}", min_value=1.0, step=1.0, value=1.0)
 
     if st.button("Wareneingang buchen"):
-        wareneingang_buchen(artikel_map[auswahl], int(menge))
-        st.success("Wareneingang erfolgreich gebucht.")
-        st.rerun()
+        try:
+            wareneingang_buchen(int(artikel["id"]), buchungs_typ, float(eingabe_menge))
+            st.success("Wareneingang erfolgreich gebucht.")
+            st.rerun()
+        except ValueError as e:
+            st.error(str(e))
 
 
 def zeige_artikel_anlegen():
-    require_admin()
+    require_role("Admin", "Lagerist")
     st.subheader("Neuen Artikel anlegen")
 
     with st.form("artikel_form"):
         artikelnummer = st.text_input("Artikelnummer")
         name = st.text_input("Artikelbezeichnung")
         lager = st.selectbox("Unterlager", LAGER)
-        verpackung_typ = st.selectbox("Verpackungsgröße", ["Stück", "Pack"])
+        verpackung_typ = st.selectbox("Verpackungsart", ["Stück", "Pack"])
         inhalt_pro_pack = st.number_input("Stück pro Pack", min_value=1, value=10, step=1)
+        packs_pro_palette = st.number_input("Pack pro Palette", min_value=1, value=10, step=1)
         bestand_stueck = st.number_input("Startbestand in Stück", min_value=0, value=0, step=1)
         senden = st.form_submit_button("Artikel speichern")
 
@@ -931,6 +1236,7 @@ def zeige_artikel_anlegen():
                     lager,
                     verpackung_typ,
                     inhalt_pro_pack,
+                    packs_pro_palette,
                     bestand_stueck,
                 )
                 st.success("Artikel wurde gespeichert.")
@@ -939,8 +1245,157 @@ def zeige_artikel_anlegen():
                 st.error("Die Artikelnummer existiert bereits.")
 
 
+def zeige_artikel_bearbeiten_loeschen():
+    require_role("Admin", "Lagerist")
+    st.subheader("Artikel bearbeiten / löschen")
+
+    df = artikel_df()
+    if df.empty:
+        st.info("Keine Artikel vorhanden.")
+        return
+
+    suchtext = st.text_input("Artikel suchen", placeholder="Artikelnummer, Name oder Lager", key="artikel_edit_suche")
+    df = suche_artikel_df(df, suchtext)
+
+    if df.empty:
+        st.info("Keine Artikel gefunden.")
+        return
+
+    artikel_map = {
+        f"{row['artikelnummer']} | {row['name']} | {row['lager']}": row
+        for _, row in df.iterrows()
+    }
+
+    auswahl = st.selectbox("Artikel auswählen", list(artikel_map.keys()))
+    artikel = artikel_map[auswahl]
+
+    tab1, tab2, tab3 = st.tabs(["Artikel bearbeiten", "Alternativen", "Artikel löschen"])
+
+    with tab1:
+        with st.form("artikel_bearbeiten_form"):
+            artikelnummer = st.text_input("Artikelnummer", value=artikel["artikelnummer"])
+            name = st.text_input("Artikelbezeichnung", value=artikel["name"])
+            lager = st.selectbox(
+                "Unterlager",
+                LAGER,
+                index=LAGER.index(artikel["lager"])
+            )
+            verpackung_typ = st.selectbox(
+                "Verpackungsart",
+                ["Stück", "Pack"],
+                index=["Stück", "Pack"].index(artikel["verpackung_typ"])
+            )
+            inhalt_pro_pack = st.number_input(
+                "Stück pro Pack",
+                min_value=1,
+                value=int(artikel["inhalt_pro_pack"]),
+                step=1
+            )
+            packs_pro_palette = st.number_input(
+                "Pack pro Palette",
+                min_value=1,
+                value=int(artikel["packs_pro_palette"]),
+                step=1
+            )
+            bestand_stueck = st.number_input(
+                "Bestand in Stück",
+                min_value=0,
+                value=int(artikel["bestand_stueck"]),
+                step=1
+            )
+
+            speichern = st.form_submit_button("Änderungen speichern")
+
+        if speichern:
+            if not artikelnummer.strip() or not name.strip():
+                st.error("Bitte Artikelnummer und Bezeichnung ausfüllen.")
+            else:
+                try:
+                    artikel_aktualisieren(
+                        artikel_id=int(artikel["id"]),
+                        artikelnummer=artikelnummer,
+                        name=name,
+                        lager=lager,
+                        verpackung_typ=verpackung_typ,
+                        inhalt_pro_pack=inhalt_pro_pack,
+                        packs_pro_palette=packs_pro_palette,
+                        bestand_stueck=bestand_stueck,
+                    )
+                    st.success("Artikel wurde aktualisiert.")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("Die Artikelnummer existiert bereits.")
+
+    with tab2:
+        st.markdown("### Alternative Artikel hinterlegen")
+
+        alle_artikel = artikel_df()
+        alle_artikel = alle_artikel[alle_artikel["id"] != artikel["id"]].copy()
+
+        vorhandene_ids = hole_artikel_alternativen_ids(int(artikel["id"]))
+
+        alt_options = {}
+        for _, row in alle_artikel.iterrows():
+            label = (
+                f"{row['artikelnummer']} | {row['name']} | {row['lager']} | "
+                f"Bestand: {row['bestand_stueck']} Stück"
+            )
+            alt_options[label] = int(row["id"])
+
+        default_labels = [label for label, aid in alt_options.items() if aid in vorhandene_ids]
+
+        neue_auswahl = st.multiselect(
+            "Alternative Artikel",
+            options=list(alt_options.keys()),
+            default=default_labels
+        )
+
+        if st.button("Alternativen speichern"):
+            alternative_ids = [alt_options[label] for label in neue_auswahl]
+            setze_artikel_alternativen(int(artikel["id"]), alternative_ids)
+            st.success("Alternative Artikel wurden gespeichert.")
+            st.rerun()
+
+        st.markdown("### Aktuell hinterlegte Alternativen")
+        alt_df = hole_artikel_alternativen_df(int(artikel["id"]))
+        if alt_df.empty:
+            st.info("Keine Alternativen hinterlegt.")
+        else:
+            anzeigen = alt_df[[
+                "artikelnummer",
+                "name",
+                "lager",
+                "bestand_stueck",
+                "bestand_pack",
+                "bestand_palette"
+            ]].copy()
+            anzeigen.columns = [
+                "Artikelnummer",
+                "Bezeichnung",
+                "Lager",
+                "Bestand Stück",
+                "Bestand Pack",
+                "Bestand Palette"
+            ]
+            st.dataframe(anzeigen, use_container_width=True)
+
+    with tab3:
+        st.warning("Achtung: Löschen ist nur möglich, wenn noch keine Wareneingänge oder Bestellungen existieren.")
+        st.write(f"**Artikelnummer:** {artikel['artikelnummer']}")
+        st.write(f"**Bezeichnung:** {artikel['name']}")
+        st.write(f"**Lager:** {artikel['lager']}")
+
+        if st.button("Artikel endgültig löschen"):
+            try:
+                artikel_loeschen(int(artikel["id"]))
+                st.success("Artikel wurde gelöscht.")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+
+
 def zeige_kundenverwaltung():
-    require_admin()
+    require_role("Admin", "Vertrieb")
     st.subheader("Kundenverwaltung")
 
     kunden_df = hole_alle_kunden()
@@ -981,119 +1436,8 @@ def zeige_kundenverwaltung():
     st.write(f"**Adresse:** {kunde['strasse']}, {kunde['plz']} {kunde['ort']}")
 
 
-def zeige_shop():
-    st.subheader("Shopfunktion")
-
-    if not kunde_ist_eingeloggt():
-        st.warning("Bitte zuerst registrieren oder einloggen, bevor bestellt werden kann.")
-        zeige_kunden_login_registrierung()
-        return
-
-    kunde = st.session_state.kunde
-    erlaubte_lager = hole_erlaubte_lager_fuer_kunde(kunde["id"])
-
-    st.success(f"Eingeloggt als: {kunde['vorname']} {kunde['nachname']} ({kunde['email']})")
-
-    if not erlaubte_lager:
-        st.error("Für diesen Kunden sind aktuell keine Unterlager freigeschaltet.")
-        return
-
-    df = artikel_df()
-    verfuegbar = df[(df["bestand_stueck"] > 0) & (df["lager"].isin(erlaubte_lager))].copy()
-
-    st.info("Sichtbar sind nur die für den Kunden freigegebenen Unterlager.")
-
-    if verfuegbar.empty:
-        st.warning("Aktuell sind keine Artikel in den freigegebenen Lagern verfügbar.")
-        return
-
-    lager_filter = st.selectbox("Lager auswählen", ["Alle"] + erlaubte_lager, key="shop_lager")
-    if lager_filter != "Alle":
-        verfuegbar = verfuegbar[verfuegbar["lager"] == lager_filter]
-
-    if verfuegbar.empty:
-        st.info("In diesem Lager sind keine Artikel verfügbar.")
-        return
-
-    artikel_map = {
-        f"{row['artikelnummer']} | {row['name']} | Bestand: {row['bestand_stueck']} Stück": row
-        for _, row in verfuegbar.iterrows()
-    }
-
-    ausgewaehlt = st.selectbox("Artikel auswählen", list(artikel_map.keys()))
-    row = artikel_map[ausgewaehlt]
-
-    menge = st.number_input(
-        "Bestellmenge in Stück",
-        min_value=1,
-        max_value=int(row["bestand_stueck"]),
-        value=1,
-        step=1
-    )
-
-    if st.button("In den Warenkorb"):
-        st.session_state.warenkorb.append({
-            "artikel_id": int(row["id"]),
-            "artikelnummer": row["artikelnummer"],
-            "name": row["name"],
-            "lager": row["lager"],
-            "menge_stueck": int(menge),
-        })
-        st.session_state.warenkorb = warenkorb_zusammenfassen(st.session_state.warenkorb)
-        st.success("Artikel wurde in den Warenkorb gelegt.")
-        st.rerun()
-
-    st.markdown("### Warenkorb")
-
-    if st.session_state.warenkorb:
-        warenkorb_df = pd.DataFrame(st.session_state.warenkorb)
-        anzeigen = warenkorb_df[["artikelnummer", "name", "lager", "menge_stueck"]].copy()
-        anzeigen.columns = ["Artikelnummer", "Bezeichnung", "Lager", "Menge Stück"]
-        st.dataframe(anzeigen, use_container_width=True)
-
-        remove_options = {
-            f"{item['artikelnummer']} | {item['name']} | Menge: {item['menge_stueck']}": idx
-            for idx, item in enumerate(st.session_state.warenkorb)
-        }
-
-        auswahl_remove = st.selectbox("Position zum Entfernen", list(remove_options.keys()))
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Gewählte Position entfernen"):
-                idx = remove_options[auswahl_remove]
-                st.session_state.warenkorb.pop(idx)
-                st.success("Position entfernt.")
-                st.rerun()
-        with col2:
-            if st.button("Warenkorb leeren"):
-                st.session_state.warenkorb = []
-                st.success("Warenkorb geleert.")
-                st.rerun()
-
-        st.markdown("### Lieferadresse")
-        standardadresse = kunden_lieferadresse_text(kunde)
-        lieferadresse = st.text_area("Lieferadresse", value=standardadresse, height=120)
-
-        if st.button("Bestellung abschließen", type="primary"):
-            try:
-                bestellnummer = bestellung_speichern(
-                    kunden_id=kunde["id"],
-                    kunde_name=kundenname_komplett(kunde),
-                    lieferadresse=lieferadresse.strip(),
-                    warenkorb=st.session_state.warenkorb
-                )
-                st.session_state.warenkorb = []
-                st.success(f"Bestellung {bestellnummer} wurde gespeichert.")
-                st.rerun()
-            except ValueError as e:
-                st.error(str(e))
-    else:
-        st.info("Der Warenkorb ist leer.")
-
-
 def zeige_bestellungen():
-    require_admin()
+    require_role("Admin", "Lagerist", "Vertrieb")
     st.subheader("Bestellungen, Kommissionierliste und Lieferschein")
 
     bestellungen = hole_bestellungen()
@@ -1112,7 +1456,6 @@ def zeige_bestellungen():
 
     st.markdown("### Bestelldaten")
     col1, col2 = st.columns(2)
-
     with col1:
         st.write(f"**Bestellnummer:** {bestellung['bestellnummer']}")
         st.write(f"**Kunde:** {bestellung['kunde_name']}")
@@ -1165,6 +1508,326 @@ def zeige_bestellungen():
             )
 
 
+def zeige_benutzerverwaltung():
+    require_role("Admin")
+    st.subheader("Interne Benutzerverwaltung")
+
+    df = hole_interne_benutzer()
+    st.dataframe(df, use_container_width=True)
+
+    st.markdown("### Neuen internen Benutzer anlegen")
+    with st.form("internal_user_form"):
+        username = st.text_input("Benutzername")
+        rolle = st.selectbox("Rolle", ROLLEN)
+        passwort = st.text_input("Passwort", type="password")
+        passwort2 = st.text_input("Passwort wiederholen", type="password")
+        speichern = st.form_submit_button("Benutzer anlegen")
+
+    if speichern:
+        if not username.strip() or not passwort:
+            st.error("Bitte Benutzername und Passwort ausfüllen.")
+        elif passwort != passwort2:
+            st.error("Die Passwörter stimmen nicht überein.")
+        else:
+            try:
+                internen_benutzer_anlegen(username, passwort, rolle)
+                st.success("Interner Benutzer wurde angelegt.")
+                st.rerun()
+            except sqlite3.IntegrityError:
+                st.error("Benutzername existiert bereits.")
+
+    st.markdown("### Eigenes Passwort ändern")
+    current_user = st.session_state.get("internal_user")
+    with st.form("change_internal_pw"):
+        neues_passwort = st.text_input("Neues Passwort", type="password")
+        neues_passwort2 = st.text_input("Neues Passwort wiederholen", type="password")
+        update = st.form_submit_button("Passwort ändern")
+
+    if update:
+        if not neues_passwort:
+            st.error("Bitte neues Passwort eingeben.")
+        elif neues_passwort != neues_passwort2:
+            st.error("Die Passwörter stimmen nicht überein.")
+        else:
+            internes_passwort_aendern(current_user["id"], neues_passwort)
+            st.success("Passwort wurde geändert.")
+
+
+# -------------------------------------------------
+# Kundenbereiche
+# -------------------------------------------------
+def zeige_mein_konto():
+    if not kunde_eingeloggt():
+        st.error("Bitte als Kunde einloggen.")
+        st.stop()
+
+    kunde = st.session_state.kunde
+    st.subheader("Mein Konto")
+    st.write(f"**Kundennummer:** {kunde['kunden_nr']}")
+    st.write(f"**Name:** {kunde_name(kunde)}")
+    st.write(f"**E-Mail:** {kunde['email']}")
+    st.write(f"**Telefon:** {kunde['telefon']}")
+    st.write("**Adresse:**")
+    st.text(kunde_lieferadresse(kunde))
+
+    erlaubte_lager = hole_erlaubte_lager_fuer_kunde(kunde["id"])
+    st.write("**Freigegebene Unterlager:**")
+    if erlaubte_lager:
+        for lager in erlaubte_lager:
+            st.write(f"- {lager}")
+    else:
+        st.write("Keine freigegebenen Unterlager.")
+
+
+def zeige_shop():
+    if not kunde_eingeloggt():
+        st.error("Bitte zuerst als Kunde einloggen.")
+        st.stop()
+
+    kunde = st.session_state.kunde
+    erlaubte_lager = hole_erlaubte_lager_fuer_kunde(kunde["id"])
+
+    st.subheader("Shop")
+    st.success(f"Eingeloggt als: {kunde['vorname']} {kunde['nachname']} ({kunde['email']})")
+
+    if not erlaubte_lager:
+        st.error("Für diesen Kunden sind aktuell keine Unterlager freigeschaltet.")
+        return
+
+    df = artikel_df()
+    sichtbare_artikel = df[df["lager"].isin(erlaubte_lager)].copy()
+
+    st.info("Sichtbar sind nur die für den Kunden freigegebenen Unterlager.")
+
+    suchtext = st.text_input("Artikel suchen", placeholder="Artikelnummer, Name oder Lager", key="shop_suche")
+    sichtbare_artikel = suche_artikel_df(sichtbare_artikel, suchtext)
+
+    lager_filter = st.selectbox("Lager auswählen", ["Alle"] + erlaubte_lager, key="shop_lager")
+    if lager_filter != "Alle":
+        sichtbare_artikel = sichtbare_artikel[sichtbare_artikel["lager"] == lager_filter]
+
+    if sichtbare_artikel.empty:
+        st.info("Keine Artikel gefunden.")
+        return
+
+    artikel_map = {
+        (
+            f"{row['artikelnummer']} | {row['name']} | Lager: {row['lager']} | "
+            f"Bestand: {row['bestand_stueck']} Stück | "
+            f"{row['bestand_pack']} Pack | {row['bestand_palette']} Palette"
+        ): row
+        for _, row in sichtbare_artikel.iterrows()
+    }
+
+    ausgewaehlt = st.selectbox("Artikel auswählen", list(artikel_map.keys()))
+    row = artikel_map[ausgewaehlt]
+
+    st.write(f"**Stück pro Pack:** {int(row['inhalt_pro_pack'])}")
+    st.write(f"**Pack pro Palette:** {int(row['packs_pro_palette'])}")
+    st.write(f"**Stück pro Palette:** {int(row['inhalt_pro_pack']) * int(row['packs_pro_palette'])}")
+    st.write(f"**Aktueller Bestand:** {int(row['bestand_stueck'])} Stück")
+
+    bestell_typ = st.selectbox("Bestellen als", ["Stück", "Pack", "Palette"])
+
+    if bestell_typ == "Palette":
+        menge_eingabe = st.number_input("Anzahl Paletten", min_value=1.0, value=1.0, step=1.0)
+    else:
+        menge_eingabe = st.number_input(f"Anzahl {bestell_typ}", min_value=1.0, value=1.0, step=1.0)
+
+    try:
+        menge_stueck = bestellmenge_zu_stueck(row, bestell_typ, float(menge_eingabe))
+    except ValueError as e:
+        st.error(str(e))
+        return
+
+    st.write(f"**Umgerechnete Bestellmenge:** {menge_stueck} Stück")
+
+    genug_bestand = menge_stueck <= int(row["bestand_stueck"])
+
+    if genug_bestand:
+        if st.button("In den Warenkorb"):
+            st.session_state.warenkorb.append({
+                "artikel_id": int(row["id"]),
+                "artikelnummer": row["artikelnummer"],
+                "name": row["name"],
+                "lager": row["lager"],
+                "menge_stueck": int(menge_stueck),
+                "bestell_typ": bestell_typ,
+                "eingabe_menge": float(menge_eingabe),
+            })
+            st.session_state.warenkorb = warenkorb_zusammenfassen(st.session_state.warenkorb)
+            st.success("Artikel wurde in den Warenkorb gelegt.")
+            st.rerun()
+    else:
+        st.error(f"Nicht genug Bestand. Verfügbar sind nur {int(row['bestand_stueck'])} Stück.")
+        st.markdown("### Alternative Artikel")
+
+        alt_df = hole_artikel_alternativen_df(int(row["id"]))
+        if not alt_df.empty:
+            alt_df = alt_df[
+                (alt_df["lager"].isin(erlaubte_lager)) &
+                (alt_df["bestand_stueck"] > 0)
+            ].copy()
+
+        if alt_df.empty:
+            st.info("Keine verfügbaren Alternativen hinterlegt.")
+        else:
+            alt_map = {
+                (
+                    f"{alt['artikelnummer']} | {alt['name']} | Lager: {alt['lager']} | "
+                    f"Bestand: {alt['bestand_stueck']} Stück | "
+                    f"{alt['bestand_pack']} Pack | {alt['bestand_palette']} Palette"
+                ): alt
+                for _, alt in alt_df.iterrows()
+            }
+
+            alt_auswahl = st.selectbox("Alternative auswählen", list(alt_map.keys()))
+            alt_row = alt_map[alt_auswahl]
+
+            st.write(f"**Alternative gewählt:** {alt_row['name']}")
+            st.write(f"**Stück pro Pack:** {int(alt_row['inhalt_pro_pack'])}")
+            st.write(f"**Pack pro Palette:** {int(alt_row['packs_pro_palette'])}")
+            st.write(f"**Bestand:** {int(alt_row['bestand_stueck'])} Stück")
+
+            try:
+                alt_menge_stueck = bestellmenge_zu_stueck(alt_row, bestell_typ, float(menge_eingabe))
+            except ValueError as e:
+                st.error(str(e))
+                alt_menge_stueck = None
+
+            if alt_menge_stueck is not None:
+                st.write(f"**Umgerechnete Menge für Alternative:** {alt_menge_stueck} Stück")
+
+                if alt_menge_stueck <= int(alt_row["bestand_stueck"]):
+                    if st.button("Alternative in den Warenkorb"):
+                        st.session_state.warenkorb.append({
+                            "artikel_id": int(alt_row["id"]),
+                            "artikelnummer": alt_row["artikelnummer"],
+                            "name": alt_row["name"],
+                            "lager": alt_row["lager"],
+                            "menge_stueck": int(alt_menge_stueck),
+                            "bestell_typ": bestell_typ,
+                            "eingabe_menge": float(menge_eingabe),
+                        })
+                        st.session_state.warenkorb = warenkorb_zusammenfassen(st.session_state.warenkorb)
+                        st.success("Alternative wurde in den Warenkorb gelegt.")
+                        st.rerun()
+                else:
+                    st.warning("Die Alternative hat ebenfalls nicht genug Bestand für diese Menge.")
+
+    st.markdown("### Warenkorb")
+    if st.session_state.warenkorb:
+        warenkorb_df = pd.DataFrame(st.session_state.warenkorb)
+
+        if "bestell_typ" not in warenkorb_df.columns:
+            warenkorb_df["bestell_typ"] = "Stück"
+        if "eingabe_menge" not in warenkorb_df.columns:
+            warenkorb_df["eingabe_menge"] = warenkorb_df["menge_stueck"]
+
+        anzeigen = warenkorb_df[[
+            "artikelnummer",
+            "name",
+            "lager",
+            "bestell_typ",
+            "eingabe_menge",
+            "menge_stueck"
+        ]].copy()
+
+        anzeigen.columns = [
+            "Artikelnummer",
+            "Bezeichnung",
+            "Lager",
+            "Bestellt als",
+            "Eingabemenge",
+            "Menge Stück"
+        ]
+
+        st.dataframe(anzeigen, use_container_width=True)
+
+        remove_options = {
+            f"{item['artikelnummer']} | {item['name']} | Menge: {item['menge_stueck']} Stück": idx
+            for idx, item in enumerate(st.session_state.warenkorb)
+        }
+        remove_selection = st.selectbox("Position zum Entfernen", list(remove_options.keys()))
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Gewählte Position entfernen"):
+                idx = remove_options[remove_selection]
+                st.session_state.warenkorb.pop(idx)
+                st.success("Position entfernt.")
+                st.rerun()
+        with col2:
+            if st.button("Warenkorb leeren"):
+                st.session_state.warenkorb = []
+                st.success("Warenkorb geleert.")
+                st.rerun()
+
+        st.markdown("### Lieferadresse")
+        standardadresse = kunde_lieferadresse(kunde)
+        lieferadresse = st.text_area("Lieferadresse", value=standardadresse, height=120)
+
+        if st.button("Bestellung abschließen", type="primary"):
+            try:
+                bestellnummer = bestellung_speichern(
+                    kunden_id=kunde["id"],
+                    kunde_name_text=kunde_name(kunde),
+                    lieferadresse=lieferadresse.strip(),
+                    warenkorb=st.session_state.warenkorb
+                )
+                st.session_state.warenkorb = []
+                st.success(f"Bestellung {bestellnummer} wurde gespeichert.")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+    else:
+        st.info("Der Warenkorb ist leer.")
+
+
+# -------------------------------------------------
+# Navigation
+# -------------------------------------------------
+def zeige_sidebar_internal():
+    user = st.session_state.get("internal_user", {})
+    rolle = user.get("rolle")
+
+    st.sidebar.success(f"Interner Benutzer: {user.get('username')} ({rolle})")
+
+    if st.sidebar.button("Logout"):
+        st.session_state.internal_logged_in = False
+        st.session_state.pop("internal_user", None)
+        st.session_state.warenkorb = []
+        st.rerun()
+
+    menue = ["Lagerbestand", "Bestellungen"]
+
+    if rolle in ["Admin", "Lagerist"]:
+        menue += ["Wareneingang", "Artikel anlegen", "Artikel bearbeiten / löschen"]
+
+    if rolle in ["Admin", "Vertrieb"]:
+        menue += ["Kundenverwaltung"]
+
+    if rolle == "Admin":
+        menue += ["Benutzerverwaltung"]
+
+    return st.sidebar.radio("Bereich auswählen", menue)
+
+
+def zeige_sidebar_kunde():
+    kunde = st.session_state.kunde
+    st.sidebar.success(f"Kunde: {kunde['vorname']} {kunde['nachname']}")
+
+    if st.sidebar.button("Logout"):
+        st.session_state.pop("kunde", None)
+        st.session_state.warenkorb = []
+        st.rerun()
+
+    return st.sidebar.radio("Bereich auswählen", ["Shop", "Mein Konto"])
+
+
+# -------------------------------------------------
+# Main
+# -------------------------------------------------
 def main():
     st.set_page_config(page_title="Lagerwirtschaft", layout="wide")
     init_db()
@@ -1172,63 +1835,35 @@ def main():
     if "warenkorb" not in st.session_state:
         st.session_state.warenkorb = []
 
-    st.title("📦 Lagerwirtschaft mit Admin-Anmeldung, Kundenregistrierung und Shop")
+    if not interner_user_eingeloggt() and not kunde_eingeloggt():
+        zeige_start_login()
+        return
 
-    st.sidebar.markdown("## Anmeldung")
+    if kunde_eingeloggt():
+        menue = zeige_sidebar_kunde()
+        if menue == "Shop":
+            zeige_shop()
+        elif menue == "Mein Konto":
+            zeige_mein_konto()
+        return
 
-    if admin_ist_eingeloggt():
-        admin = st.session_state.get("admin_user", {})
-        st.sidebar.success(f"Admin: {admin.get('username', '')}")
-        if st.sidebar.button("Admin Logout"):
-            st.session_state["admin_logged_in"] = False
-            st.session_state.pop("admin_user", None)
-            st.rerun()
-    else:
-        st.sidebar.info("Kein Admin eingeloggt")
-
-    if kunde_ist_eingeloggt():
-        kunde = st.session_state.kunde
-        st.sidebar.success(f"Kunde:\n{kunde['vorname']} {kunde['nachname']}")
-        if st.sidebar.button("Kunden Logout"):
-            st.session_state.pop("kunde", None)
-            st.session_state.warenkorb = []
-            st.rerun()
-    else:
-        st.sidebar.info("Kein Kunde eingeloggt")
-
-    menu = st.sidebar.radio(
-        "Bereich auswählen",
-        [
-            "Lagerbestand",
-            "Kunden Login / Registrierung",
-            "Shop",
-            "Admin Login",
-            "Wareneingang",
-            "Artikel anlegen",
-            "Kundenverwaltung",
-            "Bestellungen",
-            "Admin Einstellungen",
-        ]
-    )
-
-    if menu == "Lagerbestand":
-        zeige_lagerbestand()
-    elif menu == "Kunden Login / Registrierung":
-        zeige_kunden_login_registrierung()
-    elif menu == "Shop":
-        zeige_shop()
-    elif menu == "Admin Login":
-        zeige_admin_login()
-    elif menu == "Wareneingang":
-        zeige_wareneingang()
-    elif menu == "Artikel anlegen":
-        zeige_artikel_anlegen()
-    elif menu == "Kundenverwaltung":
-        zeige_kundenverwaltung()
-    elif menu == "Bestellungen":
-        zeige_bestellungen()
-    elif menu == "Admin Einstellungen":
-        zeige_admin_einstellungen()
+    if interner_user_eingeloggt():
+        menue = zeige_sidebar_internal()
+        if menue == "Lagerbestand":
+            zeige_lagerbestand()
+        elif menue == "Wareneingang":
+            zeige_wareneingang()
+        elif menue == "Artikel anlegen":
+            zeige_artikel_anlegen()
+        elif menue == "Artikel bearbeiten / löschen":
+            zeige_artikel_bearbeiten_loeschen()
+        elif menue == "Kundenverwaltung":
+            zeige_kundenverwaltung()
+        elif menue == "Bestellungen":
+            zeige_bestellungen()
+        elif menue == "Benutzerverwaltung":
+            zeige_benutzerverwaltung()
+        return
 
 
 if __name__ == "__main__":
