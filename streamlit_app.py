@@ -25,6 +25,7 @@ LAGER = [
 ]
 
 ROLLEN = ["Admin", "Lagerist", "Vertrieb"]
+BESTELLSTATUS = ["offen", "kommissioniert", "geliefert", "storniert"]
 
 
 # -------------------------------------------------
@@ -105,8 +106,8 @@ def warenkorb_zusammenfassen(warenkorb):
         else:
             zusammen[key]["menge_stueck"] += item["menge_stueck"]
             zusammen[key]["eingabe_menge"] = (
-                float(zusammen[key].get("eingabe_menge", 0)) +
-                float(item.get("eingabe_menge", 0))
+                float(zusammen[key].get("eingabe_menge", 0))
+                + float(item.get("eingabe_menge", 0))
             )
     return list(zusammen.values())
 
@@ -134,6 +135,7 @@ def build_kommissionierliste_text(bestellung, positionen):
     lines.append(f"Datum: {bestellung['datum']}")
     lines.append(f"Uhrzeit: {bestellung['uhrzeit']}")
     lines.append(f"Kunde: {bestellung['kunde_name']}")
+    lines.append(f"Status: {bestellung['status']}")
     lines.append("")
     lines.append("Artikel:")
     lines.append("")
@@ -154,6 +156,7 @@ def build_lieferschein_text(bestellung, positionen):
     lines.append(f"Lieferadresse: {bestellung['lieferadresse']}")
     lines.append(f"Datum: {bestellung['datum']}")
     lines.append(f"Uhrzeit: {bestellung['uhrzeit']}")
+    lines.append(f"Status: {bestellung['status']}")
     lines.append("")
     lines.append("Bestellte Materialien:")
     lines.append("")
@@ -254,6 +257,8 @@ def init_db():
             lieferadresse TEXT NOT NULL,
             datum TEXT NOT NULL,
             uhrzeit TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'offen',
+            status_geaendert_am TEXT,
             FOREIGN KEY (kunden_id) REFERENCES kunden(id)
         )
     """)
@@ -294,10 +299,11 @@ def init_db():
     conn.commit()
     conn.close()
 
-    # Migration für ältere Datenbanken
     ensure_column_exists("artikel", "packs_pro_palette", "INTEGER NOT NULL DEFAULT 10")
     ensure_column_exists("wareneingang", "buchungs_typ", "TEXT")
     ensure_column_exists("wareneingang", "eingabe_menge", "REAL")
+    ensure_column_exists("bestellungen", "status", "TEXT NOT NULL DEFAULT 'offen'")
+    ensure_column_exists("bestellungen", "status_geaendert_am", "TEXT")
 
     conn = get_connection()
     cur = conn.cursor()
@@ -508,6 +514,43 @@ def setze_lagerfreigaben_fuer_kunde(kunden_id: int, erlaubte_lager: list):
             DO UPDATE SET erlaubt = excluded.erlaubt
         """, (kunden_id, lager, erlaubt))
 
+    conn.commit()
+    conn.close()
+
+
+def kunde_passwort_aendern(kunden_id: int, altes_passwort: str, neues_passwort: str):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT passwort_hash FROM kunden WHERE id = ?", (kunden_id,))
+    row = cur.fetchone()
+
+    if row is None:
+        conn.close()
+        raise ValueError("Kunde wurde nicht gefunden.")
+
+    if row["passwort_hash"] != hash_password(altes_passwort):
+        conn.close()
+        raise ValueError("Das aktuelle Passwort ist falsch.")
+
+    cur.execute("""
+        UPDATE kunden
+        SET passwort_hash = ?
+        WHERE id = ?
+    """, (hash_password(neues_passwort), kunden_id))
+
+    conn.commit()
+    conn.close()
+
+
+def kunde_passwort_admin_reset(kunden_id: int, neues_passwort: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE kunden
+        SET passwort_hash = ?
+        WHERE id = ?
+    """, (hash_password(neues_passwort), kunden_id))
     conn.commit()
     conn.close()
 
@@ -777,9 +820,9 @@ def bestellung_speichern(kunden_id: int, kunde_name_text: str, lieferadresse: st
 
     cur.execute("""
         INSERT INTO bestellungen (
-            bestellnummer, kunden_id, kunde_name, lieferadresse, datum, uhrzeit
+            bestellnummer, kunden_id, kunde_name, lieferadresse, datum, uhrzeit, status, status_geaendert_am
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         bestellnummer,
         kunden_id,
@@ -787,6 +830,8 @@ def bestellung_speichern(kunden_id: int, kunde_name_text: str, lieferadresse: st
         lieferadresse,
         jetzt.strftime("%d.%m.%Y"),
         jetzt.strftime("%H:%M:%S"),
+        "offen",
+        jetzt.strftime("%Y-%m-%d %H:%M:%S"),
     ))
     bestellung_id = cur.lastrowid
 
@@ -816,6 +861,37 @@ def hole_bestellungen():
     """, conn)
     conn.close()
     return df
+
+
+def hole_bestellungen_fuer_kunde(kunden_id: int):
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT *
+        FROM bestellungen
+        WHERE kunden_id = ?
+        ORDER BY id DESC
+    """, conn, params=(kunden_id,))
+    conn.close()
+    return df
+
+
+def bestellstatus_setzen(bestellung_id: int, neuer_status: str):
+    if neuer_status not in BESTELLSTATUS:
+        raise ValueError("Ungültiger Bestellstatus.")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE bestellungen
+        SET status = ?, status_geaendert_am = ?
+        WHERE id = ?
+    """, (
+        neuer_status,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        int(bestellung_id),
+    ))
+    conn.commit()
+    conn.close()
 
 
 def hole_bestellpositionen(bestell_id: int):
@@ -931,6 +1007,7 @@ def generate_pdf_lieferschein(bestellung, positionen):
         ["Lieferadresse", bestellung["lieferadresse"].replace("\n", "<br/>")],
         ["Datum", bestellung["datum"]],
         ["Uhrzeit", bestellung["uhrzeit"]],
+        ["Status", bestellung["status"]],
     ]
 
     info_table = Table(info, colWidths=[45 * mm, 120 * mm])
@@ -998,6 +1075,7 @@ def generate_pdf_kommissionierliste(bestellung, positionen):
         ["Kunde", bestellung["kunde_name"]],
         ["Datum", bestellung["datum"]],
         ["Uhrzeit", bestellung["uhrzeit"]],
+        ["Status", bestellung["status"]],
     ]
 
     info_table = Table(info, colWidths=[45 * mm, 120 * mm])
@@ -1167,6 +1245,280 @@ def zeige_lagerbestand():
     ]
 
     st.dataframe(anzeigen, use_container_width=True)
+
+
+def zeige_gesamtmonitor():
+    require_role("Admin", "Lagerist", "Vertrieb")
+    st.subheader("Gesamtmonitor Bestellübersicht")
+
+    bestellungen = hole_bestellungen()
+
+    if bestellungen.empty:
+        st.info("Es gibt noch keine Bestellungen.")
+        return
+
+    offen_count = len(bestellungen[bestellungen["status"] == "offen"])
+    komm_count = len(bestellungen[bestellungen["status"] == "kommissioniert"])
+    geliefert_count = len(bestellungen[bestellungen["status"] == "geliefert"])
+    storniert_count = len(bestellungen[bestellungen["status"] == "storniert"])
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Offen", offen_count)
+    c2.metric("Kommissioniert", komm_count)
+    c3.metric("Geliefert", geliefert_count)
+    c4.metric("Storniert", storniert_count)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        status_filter = st.selectbox(
+            "Status filtern",
+            ["Alle"] + BESTELLSTATUS,
+            key="monitor_status_filter"
+        )
+
+    with col2:
+        suchtext = st.text_input(
+            "Suche",
+            placeholder="Bestellnummer, Kunde, Lieferadresse, Datum",
+            key="monitor_suche"
+        ).strip().lower()
+
+    df = bestellungen.copy()
+
+    if status_filter != "Alle":
+        df = df[df["status"] == status_filter]
+
+    if suchtext:
+        df = df[
+            df["bestellnummer"].astype(str).str.lower().str.contains(suchtext, na=False)
+            | df["kunde_name"].astype(str).str.lower().str.contains(suchtext, na=False)
+            | df["lieferadresse"].astype(str).str.lower().str.contains(suchtext, na=False)
+            | df["datum"].astype(str).str.lower().str.contains(suchtext, na=False)
+            | df["uhrzeit"].astype(str).str.lower().str.contains(suchtext, na=False)
+            | df["status"].astype(str).str.lower().str.contains(suchtext, na=False)
+        ].copy()
+
+    if df.empty:
+        st.info("Keine Bestellungen für den aktuellen Filter gefunden.")
+        return
+
+    anzeige = df[[
+        "bestellnummer",
+        "datum",
+        "uhrzeit",
+        "kunde_name",
+        "status",
+        "lieferadresse"
+    ]].copy()
+
+    anzeige.columns = [
+        "Lieferscheinnummer",
+        "Datum",
+        "Uhrzeit",
+        "Kunde",
+        "Status",
+        "Lieferadresse"
+    ]
+
+    def status_farbe(status):
+        if status == "offen":
+            return "background-color: #fff3cd; color: #856404;"
+        if status == "kommissioniert":
+            return "background-color: #d1ecf1; color: #0c5460;"
+        if status == "geliefert":
+            return "background-color: #d4edda; color: #155724;"
+        if status == "storniert":
+            return "background-color: #f8d7da; color: #721c24;"
+        return ""
+
+    styled_df = anzeige.style.map(status_farbe, subset=["Status"])
+
+    st.dataframe(styled_df, use_container_width=True, height=550)
+
+    st.markdown("### Status-Legende")
+    l1, l2, l3, l4 = st.columns(4)
+    with l1:
+        st.markdown("🟨 **offen**")
+    with l2:
+        st.markdown("🟦 **kommissioniert**")
+    with l3:
+        st.markdown("🟩 **geliefert**")
+    with l4:
+        st.markdown("🟥 **storniert**")
+
+
+def zeige_tv_monitor():
+    require_role("Admin", "Lagerist", "Vertrieb")
+
+    bestellungen = hole_bestellungen()
+
+    offen_count = len(bestellungen[bestellungen["status"] == "offen"]) if not bestellungen.empty else 0
+    komm_count = len(bestellungen[bestellungen["status"] == "kommissioniert"]) if not bestellungen.empty else 0
+    geliefert_count = len(bestellungen[bestellungen["status"] == "geliefert"]) if not bestellungen.empty else 0
+    storniert_count = len(bestellungen[bestellungen["status"] == "storniert"]) if not bestellungen.empty else 0
+
+    df = bestellungen.copy()
+
+    if not df.empty:
+        df = df[[
+            "bestellnummer",
+            "datum",
+            "uhrzeit",
+            "kunde_name",
+            "status"
+        ]].copy()
+
+        df.columns = [
+            "Lieferscheinnummer",
+            "Datum",
+            "Uhrzeit",
+            "Kunde",
+            "Status"
+        ]
+
+    components.html(
+        """
+        <script>
+            setTimeout(function() {
+                window.location.reload();
+            }, 30000);
+        </script>
+        """,
+        height=0,
+    )
+
+    st.markdown("""
+    <style>
+        header[data-testid="stHeader"] {display: none;}
+        section[data-testid="stSidebar"] {display: none;}
+        div[data-testid="stToolbar"] {display: none;}
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+
+        .block-container {
+            padding-top: 1rem;
+            padding-bottom: 1rem;
+            padding-left: 1.5rem;
+            padding-right: 1.5rem;
+            max-width: 100%;
+        }
+
+        .tv-title {
+            font-size: 42px;
+            font-weight: 800;
+            margin-bottom: 10px;
+        }
+
+        .tv-subtitle {
+            font-size: 20px;
+            color: #666;
+            margin-bottom: 20px;
+        }
+
+        .tv-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 18px;
+            margin-bottom: 24px;
+        }
+
+        .tv-card {
+            border-radius: 18px;
+            padding: 24px;
+            color: #111;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+            text-align: center;
+        }
+
+        .tv-card h3 {
+            margin: 0;
+            font-size: 24px;
+            font-weight: 700;
+        }
+
+        .tv-card .value {
+            margin-top: 10px;
+            font-size: 48px;
+            font-weight: 800;
+        }
+
+        .tv-offen { background: #fff3cd; }
+        .tv-kommissioniert { background: #d1ecf1; }
+        .tv-geliefert { background: #d4edda; }
+        .tv-storniert { background: #f8d7da; }
+
+        .tv-table-title {
+            font-size: 28px;
+            font-weight: 700;
+            margin-top: 10px;
+            margin-bottom: 10px;
+        }
+
+        .tv-refresh {
+            font-size: 18px;
+            color: #666;
+            margin-bottom: 18px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="tv-title">📺 TV-Monitor Bestellstatus</div>', unsafe_allow_html=True)
+    st.markdown('<div class="tv-subtitle">Automatische Aktualisierung alle 30 Sekunden</div>', unsafe_allow_html=True)
+
+    st.markdown(f"""
+    <div class="tv-grid">
+        <div class="tv-card tv-offen">
+            <h3>Offen</h3>
+            <div class="value">{offen_count}</div>
+        </div>
+        <div class="tv-card tv-kommissioniert">
+            <h3>Kommissioniert</h3>
+            <div class="value">{komm_count}</div>
+        </div>
+        <div class="tv-card tv-geliefert">
+            <h3>Geliefert</h3>
+            <div class="value">{geliefert_count}</div>
+        </div>
+        <div class="tv-card tv-storniert">
+            <h3>Storniert</h3>
+            <div class="value">{storniert_count}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="tv-table-title">Aktuelle Bestellungen</div>', unsafe_allow_html=True)
+    st.markdown('<div class="tv-refresh">Ansicht ist für einen TV- oder Wandmonitor optimiert.</div>', unsafe_allow_html=True)
+
+    if df.empty:
+        st.info("Es sind aktuell keine Bestellungen vorhanden.")
+        return
+
+    def status_farbe(status):
+        if status == "offen":
+            return "background-color: #fff3cd; color: #856404; font-weight: 700; font-size: 22px;"
+        if status == "kommissioniert":
+            return "background-color: #d1ecf1; color: #0c5460; font-weight: 700; font-size: 22px;"
+        if status == "geliefert":
+            return "background-color: #d4edda; color: #155724; font-weight: 700; font-size: 22px;"
+        if status == "storniert":
+            return "background-color: #f8d7da; color: #721c24; font-weight: 700; font-size: 22px;"
+        return ""
+
+    styled_df = (
+        df.style
+        .map(status_farbe, subset=["Status"])
+        .set_properties(**{
+            "font-size": "22px",
+            "text-align": "left",
+        })
+    )
+
+    st.dataframe(
+        styled_df,
+        use_container_width=True,
+        height=700
+    )
 
 
 def zeige_wareneingang():
@@ -1416,24 +1768,41 @@ def zeige_kundenverwaltung():
     kunde = hole_kunde_by_id(kunden_id)
     erlaubte_lager = hole_erlaubte_lager_fuer_kunde(kunden_id)
 
-    st.markdown("### Lagerfreigaben")
-    neue_freigaben = st.multiselect(
-        "Erlaubte Unterlager für diesen Kunden",
-        options=LAGER,
-        default=erlaubte_lager
-    )
+    tab1, tab2, tab3 = st.tabs(["Lagerfreigaben", "Kundendaten", "Passwort zurücksetzen"])
 
-    if st.button("Lagerfreigaben speichern"):
-        setze_lagerfreigaben_fuer_kunde(kunden_id, neue_freigaben)
-        st.success("Lagerfreigaben gespeichert.")
-        st.rerun()
+    with tab1:
+        neue_freigaben = st.multiselect(
+            "Erlaubte Unterlager für diesen Kunden",
+            options=LAGER,
+            default=erlaubte_lager
+        )
 
-    st.markdown("### Kundendaten")
-    st.write(f"**Kundennummer:** {kunde['kunden_nr']}")
-    st.write(f"**Name:** {kunde['vorname']} {kunde['nachname']}")
-    st.write(f"**E-Mail:** {kunde['email']}")
-    st.write(f"**Telefon:** {kunde['telefon']}")
-    st.write(f"**Adresse:** {kunde['strasse']}, {kunde['plz']} {kunde['ort']}")
+        if st.button("Lagerfreigaben speichern"):
+            setze_lagerfreigaben_fuer_kunde(kunden_id, neue_freigaben)
+            st.success("Lagerfreigaben gespeichert.")
+            st.rerun()
+
+    with tab2:
+        st.write(f"**Kundennummer:** {kunde['kunden_nr']}")
+        st.write(f"**Name:** {kunde['vorname']} {kunde['nachname']}")
+        st.write(f"**E-Mail:** {kunde['email']}")
+        st.write(f"**Telefon:** {kunde['telefon']}")
+        st.write(f"**Adresse:** {kunde['strasse']}, {kunde['plz']} {kunde['ort']}")
+
+    with tab3:
+        with st.form("kunde_reset_pw_form"):
+            neues_passwort = st.text_input("Neues Passwort für Kunden", type="password")
+            neues_passwort2 = st.text_input("Neues Passwort wiederholen", type="password")
+            reset_btn = st.form_submit_button("Passwort zurücksetzen")
+
+        if reset_btn:
+            if not neues_passwort:
+                st.error("Bitte ein neues Passwort eingeben.")
+            elif neues_passwort != neues_passwort2:
+                st.error("Die Passwörter stimmen nicht überein.")
+            else:
+                kunde_passwort_admin_reset(kunden_id, neues_passwort)
+                st.success("Kundenpasswort wurde zurückgesetzt.")
 
 
 def zeige_bestellungen():
@@ -1445,8 +1814,17 @@ def zeige_bestellungen():
         st.info("Es gibt noch keine Bestellungen.")
         return
 
+    status_filter = st.selectbox("Status filtern", ["Alle"] + BESTELLSTATUS)
+
+    if status_filter != "Alle":
+        bestellungen = bestellungen[bestellungen["status"] == status_filter]
+
+    if bestellungen.empty:
+        st.info("Keine Bestellungen für diesen Filter gefunden.")
+        return
+
     auswahl_map = {
-        f"{row['bestellnummer']} | {row['kunde_name']} | {row['datum']} {row['uhrzeit']}": row
+        f"{row['bestellnummer']} | {row['kunde_name']} | {row['datum']} {row['uhrzeit']} | {row['status']}": row
         for _, row in bestellungen.iterrows()
     }
 
@@ -1456,14 +1834,32 @@ def zeige_bestellungen():
 
     st.markdown("### Bestelldaten")
     col1, col2 = st.columns(2)
+
     with col1:
         st.write(f"**Bestellnummer:** {bestellung['bestellnummer']}")
         st.write(f"**Kunde:** {bestellung['kunde_name']}")
         st.write(f"**Datum:** {bestellung['datum']}")
         st.write(f"**Uhrzeit:** {bestellung['uhrzeit']}")
+        st.write(f"**Status:** {bestellung['status']}")
+
     with col2:
         st.write("**Lieferadresse:**")
         st.write(bestellung["lieferadresse"])
+
+    st.markdown("### Bestellstatus ändern")
+    neuer_status = st.selectbox(
+        "Neuen Status wählen",
+        BESTELLSTATUS,
+        index=BESTELLSTATUS.index(bestellung["status"]) if bestellung["status"] in BESTELLSTATUS else 0
+    )
+
+    if st.button("Bestellstatus speichern"):
+        try:
+            bestellstatus_setzen(int(bestellung["id"]), neuer_status)
+            st.success("Bestellstatus wurde aktualisiert.")
+            st.rerun()
+        except ValueError as e:
+            st.error(str(e))
 
     st.markdown("### Positionen")
     st.dataframe(positionen, use_container_width=True)
@@ -1477,14 +1873,14 @@ def zeige_bestellungen():
 
     with tab1:
         st.text_area("Kommissionierliste Vorschau", value=kom_text, height=350)
-        col1, col2 = st.columns(2)
-        with col1:
+        col_a, col_b = st.columns(2)
+        with col_a:
             pdf_download_button(
                 kom_pdf,
                 f"Kommissionierliste_{bestellung['bestellnummer']}.pdf",
                 "📄 PDF-Kommissionierliste herunterladen"
             )
-        with col2:
+        with col_b:
             render_print_button(
                 title=f"Kommissionierliste {bestellung['bestellnummer']}",
                 text_content=kom_text,
@@ -1493,14 +1889,14 @@ def zeige_bestellungen():
 
     with tab2:
         st.text_area("Lieferschein Vorschau", value=lief_text, height=350)
-        col1, col2 = st.columns(2)
-        with col1:
+        col_a, col_b = st.columns(2)
+        with col_a:
             pdf_download_button(
                 lief_pdf,
                 f"Lieferschein_{bestellung['bestellnummer']}.pdf",
                 "📄 PDF-Lieferschein herunterladen"
             )
-        with col2:
+        with col_b:
             render_print_button(
                 title=f"Lieferschein {bestellung['bestellnummer']}",
                 text_content=lief_text,
@@ -1563,20 +1959,43 @@ def zeige_mein_konto():
 
     kunde = st.session_state.kunde
     st.subheader("Mein Konto")
-    st.write(f"**Kundennummer:** {kunde['kunden_nr']}")
-    st.write(f"**Name:** {kunde_name(kunde)}")
-    st.write(f"**E-Mail:** {kunde['email']}")
-    st.write(f"**Telefon:** {kunde['telefon']}")
-    st.write("**Adresse:**")
-    st.text(kunde_lieferadresse(kunde))
 
-    erlaubte_lager = hole_erlaubte_lager_fuer_kunde(kunde["id"])
-    st.write("**Freigegebene Unterlager:**")
-    if erlaubte_lager:
-        for lager in erlaubte_lager:
-            st.write(f"- {lager}")
-    else:
-        st.write("Keine freigegebenen Unterlager.")
+    tab1, tab2 = st.tabs(["Kundendaten", "Passwort ändern"])
+
+    with tab1:
+        st.write(f"**Kundennummer:** {kunde['kunden_nr']}")
+        st.write(f"**Name:** {kunde_name(kunde)}")
+        st.write(f"**E-Mail:** {kunde['email']}")
+        st.write(f"**Telefon:** {kunde['telefon']}")
+        st.write("**Adresse:**")
+        st.text(kunde_lieferadresse(kunde))
+
+        erlaubte_lager = hole_erlaubte_lager_fuer_kunde(kunde["id"])
+        st.write("**Freigegebene Unterlager:**")
+        if erlaubte_lager:
+            for lager in erlaubte_lager:
+                st.write(f"- {lager}")
+        else:
+            st.write("Keine freigegebenen Unterlager.")
+
+    with tab2:
+        with st.form("kunde_passwort_aendern_form"):
+            altes_passwort = st.text_input("Aktuelles Passwort", type="password")
+            neues_passwort = st.text_input("Neues Passwort", type="password")
+            neues_passwort2 = st.text_input("Neues Passwort wiederholen", type="password")
+            speichern = st.form_submit_button("Passwort ändern")
+
+        if speichern:
+            if not altes_passwort or not neues_passwort:
+                st.error("Bitte alle Passwortfelder ausfüllen.")
+            elif neues_passwort != neues_passwort2:
+                st.error("Die neuen Passwörter stimmen nicht überein.")
+            else:
+                try:
+                    kunde_passwort_aendern(kunde["id"], altes_passwort, neues_passwort)
+                    st.success("Passwort wurde geändert.")
+                except ValueError as e:
+                    st.error(str(e))
 
 
 def zeige_shop():
@@ -1784,6 +2203,77 @@ def zeige_shop():
         st.info("Der Warenkorb ist leer.")
 
 
+def zeige_meine_bestellungen():
+    if not kunde_eingeloggt():
+        st.error("Bitte zuerst als Kunde einloggen.")
+        st.stop()
+
+    kunde = st.session_state.kunde
+    st.subheader("Meine Bestellungen")
+
+    bestellungen = hole_bestellungen_fuer_kunde(kunde["id"])
+    if bestellungen.empty:
+        st.info("Es liegen noch keine Bestellungen vor.")
+        return
+
+    status_filter = st.selectbox("Status filtern", ["Alle"] + BESTELLSTATUS)
+
+    if status_filter != "Alle":
+        bestellungen = bestellungen[bestellungen["status"] == status_filter]
+
+    if bestellungen.empty:
+        st.info("Keine Bestellungen für diesen Filter gefunden.")
+        return
+
+    auswahl_map = {
+        f"{row['bestellnummer']} | {row['datum']} {row['uhrzeit']} | Status: {row['status']}": row
+        for _, row in bestellungen.iterrows()
+    }
+
+    auswahl = st.selectbox("Bestellung auswählen", list(auswahl_map.keys()))
+    bestellung = auswahl_map[auswahl]
+    positionen = hole_bestellpositionen(int(bestellung["id"]))
+
+    st.markdown("### Bestelldaten")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.write(f"**Bestellnummer:** {bestellung['bestellnummer']}")
+        st.write(f"**Datum:** {bestellung['datum']}")
+        st.write(f"**Uhrzeit:** {bestellung['uhrzeit']}")
+        st.write(f"**Status:** {bestellung['status']}")
+
+    with col2:
+        st.write("**Lieferadresse:**")
+        st.write(bestellung["lieferadresse"])
+
+    st.markdown("### Positionen")
+    st.dataframe(positionen, use_container_width=True)
+
+    kom_text = build_kommissionierliste_text(bestellung, positionen)
+    lief_text = build_lieferschein_text(bestellung, positionen)
+    kom_pdf = generate_pdf_kommissionierliste(bestellung, positionen)
+    lief_pdf = generate_pdf_lieferschein(bestellung, positionen)
+
+    tab1, tab2 = st.tabs(["Kommissionierliste", "Lieferschein"])
+
+    with tab1:
+        st.text_area("Kommissionierliste Vorschau", value=kom_text, height=300)
+        pdf_download_button(
+            kom_pdf,
+            f"Kommissionierliste_{bestellung['bestellnummer']}.pdf",
+            "📄 PDF-Kommissionierliste herunterladen"
+        )
+
+    with tab2:
+        st.text_area("Lieferschein Vorschau", value=lief_text, height=300)
+        pdf_download_button(
+            lief_pdf,
+            f"Lieferschein_{bestellung['bestellnummer']}.pdf",
+            "📄 PDF-Lieferschein herunterladen"
+        )
+
+
 # -------------------------------------------------
 # Navigation
 # -------------------------------------------------
@@ -1799,7 +2289,7 @@ def zeige_sidebar_internal():
         st.session_state.warenkorb = []
         st.rerun()
 
-    menue = ["Lagerbestand", "Bestellungen"]
+    menue = ["Lagerbestand", "Gesamtmonitor", "TV-Monitor", "Bestellungen"]
 
     if rolle in ["Admin", "Lagerist"]:
         menue += ["Wareneingang", "Artikel anlegen", "Artikel bearbeiten / löschen"]
@@ -1822,7 +2312,7 @@ def zeige_sidebar_kunde():
         st.session_state.warenkorb = []
         st.rerun()
 
-    return st.sidebar.radio("Bereich auswählen", ["Shop", "Mein Konto"])
+    return st.sidebar.radio("Bereich auswählen", ["Shop", "Mein Konto", "Meine Bestellungen"])
 
 
 # -------------------------------------------------
@@ -1845,12 +2335,20 @@ def main():
             zeige_shop()
         elif menue == "Mein Konto":
             zeige_mein_konto()
+        elif menue == "Meine Bestellungen":
+            zeige_meine_bestellungen()
         return
 
     if interner_user_eingeloggt():
         menue = zeige_sidebar_internal()
         if menue == "Lagerbestand":
             zeige_lagerbestand()
+        elif menue == "Gesamtmonitor":
+            zeige_gesamtmonitor()
+        elif menue == "TV-Monitor":
+            zeige_tv_monitor()
+        elif menue == "Bestellungen":
+            zeige_bestellungen()
         elif menue == "Wareneingang":
             zeige_wareneingang()
         elif menue == "Artikel anlegen":
@@ -1859,8 +2357,6 @@ def main():
             zeige_artikel_bearbeiten_loeschen()
         elif menue == "Kundenverwaltung":
             zeige_kundenverwaltung()
-        elif menue == "Bestellungen":
-            zeige_bestellungen()
         elif menue == "Benutzerverwaltung":
             zeige_benutzerverwaltung()
         return
