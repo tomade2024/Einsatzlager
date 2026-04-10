@@ -12,7 +12,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
-DB_FILE = "lager_v3.db"
+DB_FILE = "lager_v31.db"
 
 LAGER = [
     "Medizinlager",
@@ -92,6 +92,7 @@ def kunde_name(kunde_row):
     firmenname = kunde_row["firmenname"] or ""
     vorname = kunde_row["vorname"] or ""
     nachname = kunde_row["nachname"] or ""
+
     if firmenname.strip():
         return f"{firmenname} / {vorname} {nachname}".strip()
     return f"{vorname} {nachname}".strip()
@@ -122,6 +123,30 @@ def warenkorb_zusammenfassen(warenkorb):
     return list(zusammen.values())
 
 
+def warnstatus_text(verfuegbar: int, mindest: int, melde: int) -> str:
+    if verfuegbar <= mindest:
+        return "Mindestbestand unterschritten"
+    if verfuegbar <= melde:
+        return "Meldebestand erreicht"
+    return "OK"
+
+
+def status_style(status: str) -> str:
+    if status == "offen":
+        return "background-color: #fff3cd; color: #856404;"
+    if status == "in_bearbeitung":
+        return "background-color: #fde2b5; color: #8a4b08;"
+    if status == "kommissioniert":
+        return "background-color: #d1ecf1; color: #0c5460;"
+    if status == "verladen":
+        return "background-color: #d6d8ff; color: #2f3b8f;"
+    if status == "geliefert":
+        return "background-color: #d4edda; color: #155724;"
+    if status == "storniert":
+        return "background-color: #f8d7da; color: #721c24;"
+    return ""
+
+
 def suche_artikel_df(df: pd.DataFrame, suchtext: str):
     if df.empty:
         return df
@@ -141,30 +166,6 @@ def suche_artikel_df(df: pd.DataFrame, suchtext: str):
         | df["lieferant"].astype(str).str.lower().str.contains(suchtext, na=False)
         | df["lieferanten_artikelnummer"].astype(str).str.lower().str.contains(suchtext, na=False)
     ].copy()
-
-
-def status_style(status: str) -> str:
-    if status == "offen":
-        return "background-color: #fff3cd; color: #856404;"
-    if status == "in_bearbeitung":
-        return "background-color: #fde2b5; color: #8a4b08;"
-    if status == "kommissioniert":
-        return "background-color: #d1ecf1; color: #0c5460;"
-    if status == "verladen":
-        return "background-color: #d6d8ff; color: #2f3b8f;"
-    if status == "geliefert":
-        return "background-color: #d4edda; color: #155724;"
-    if status == "storniert":
-        return "background-color: #f8d7da; color: #721c24;"
-    return ""
-
-
-def warnstatus_text(verfuegbar: int, mindest: int, melde: int) -> str:
-    if verfuegbar <= mindest:
-        return "Mindestbestand unterschritten"
-    if verfuegbar <= melde:
-        return "Meldebestand erreicht"
-    return "OK"
 
 
 def build_kommissionierliste_text(bestellung, positionen):
@@ -423,11 +424,209 @@ def init_db():
 
 
 # -------------------------------------------------
+# Interne Benutzer / Rollen
+# -------------------------------------------------
+def internal_login(username: str, passwort: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM internal_users
+        WHERE username = ? AND passwort_hash = ? AND ist_aktiv = 1
+    """, (
+        username.strip(),
+        hash_password(passwort)
+    ))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def hole_interne_benutzer():
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT id, username, rolle, erstellt_am, ist_aktiv
+        FROM internal_users
+        ORDER BY rolle, username
+    """, conn)
+    conn.close()
+    return df
+
+
+def internen_benutzer_anlegen(username: str, passwort: str, rolle: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO internal_users (username, passwort_hash, rolle, erstellt_am, ist_aktiv)
+        VALUES (?, ?, ?, ?, 1)
+    """, (
+        username.strip(),
+        hash_password(passwort),
+        rolle,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    ))
+    conn.commit()
+    conn.close()
+
+
+def internes_passwort_aendern(user_id: int, neues_passwort: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE internal_users
+        SET passwort_hash = ?
+        WHERE id = ?
+    """, (hash_password(neues_passwort), user_id))
+    conn.commit()
+    conn.close()
+
+
+# -------------------------------------------------
+# Kunden
+# -------------------------------------------------
+def kunde_registrieren(
+    firmenname,
+    anrede,
+    vorname,
+    nachname,
+    email,
+    telefon,
+    strasse,
+    plz,
+    ort,
+    passwort
+):
+    conn = get_connection()
+    cur = conn.cursor()
+    zeit = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    kunden_nr = f"K-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+    cur.execute("""
+        INSERT INTO kunden (
+            kunden_nr, firmenname, anrede, vorname, nachname, email, telefon,
+            strasse, plz, ort, passwort_hash, erstellt_am, ist_aktiv
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    """, (
+        kunden_nr,
+        firmenname.strip(),
+        anrede.strip(),
+        vorname.strip(),
+        nachname.strip(),
+        email.strip().lower(),
+        telefon.strip(),
+        strasse.strip(),
+        plz.strip(),
+        ort.strip(),
+        hash_password(passwort),
+        zeit
+    ))
+
+    kunden_id = cur.lastrowid
+    for lager in LAGER:
+        cur.execute("""
+            INSERT INTO kunden_lager_freigaben (kunden_id, lager, erlaubt)
+            VALUES (?, ?, 1)
+        """, (kunden_id, lager))
+
+    conn.commit()
+    conn.close()
+    return kunden_nr
+
+
+def kunde_login(email: str, passwort: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM kunden
+        WHERE lower(email) = ? AND passwort_hash = ? AND ist_aktiv = 1
+    """, (email.strip().lower(), hash_password(passwort)))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def hole_alle_kunden():
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT id, kunden_nr, firmenname, anrede, vorname, nachname, email, telefon,
+               strasse, plz, ort, erstellt_am, ist_aktiv
+        FROM kunden
+        ORDER BY nachname, vorname
+    """, conn)
+    conn.close()
+    return df
+
+
+def hole_kunde_by_id(kunden_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM kunden WHERE id = ?", (kunden_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def hole_erlaubte_lager_fuer_kunde(kunden_id: int):
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT lager
+        FROM kunden_lager_freigaben
+        WHERE kunden_id = ? AND erlaubt = 1
+        ORDER BY lager
+    """, conn, params=(kunden_id,))
+    conn.close()
+    return df["lager"].tolist()
+
+
+def setze_lagerfreigaben_fuer_kunde(kunden_id: int, erlaubte_lager: list):
+    conn = get_connection()
+    cur = conn.cursor()
+    for lager in LAGER:
+        erlaubt = 1 if lager in erlaubte_lager else 0
+        cur.execute("""
+            INSERT INTO kunden_lager_freigaben (kunden_id, lager, erlaubt)
+            VALUES (?, ?, ?)
+            ON CONFLICT(kunden_id, lager)
+            DO UPDATE SET erlaubt = excluded.erlaubt
+        """, (kunden_id, lager, erlaubt))
+    conn.commit()
+    conn.close()
+
+
+def kunde_passwort_aendern(kunden_id: int, altes_passwort: str, neues_passwort: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT passwort_hash FROM kunden WHERE id = ?", (kunden_id,))
+    row = cur.fetchone()
+
+    if row is None:
+        conn.close()
+        raise ValueError("Kunde wurde nicht gefunden.")
+    if row["passwort_hash"] != hash_password(altes_passwort):
+        conn.close()
+        raise ValueError("Das aktuelle Passwort ist falsch.")
+
+    cur.execute("UPDATE kunden SET passwort_hash = ? WHERE id = ?", (hash_password(neues_passwort), kunden_id))
+    conn.commit()
+    conn.close()
+
+
+def kunde_passwort_admin_reset(kunden_id: int, neues_passwort: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE kunden SET passwort_hash = ? WHERE id = ?", (hash_password(neues_passwort), kunden_id))
+    conn.commit()
+    conn.close()
+
+
+# -------------------------------------------------
 # Artikel / Lager
 # -------------------------------------------------
 def artikel_df():
     conn = get_connection()
-    df = pd.read_sql_query("SELECT * FROM artikel ORDER BY lager, name", conn)
+    df = pd.read_sql_query("SELECT * FROM artikel ORDER BY lager, lagerplatz, name", conn)
     conn.close()
 
     if not df.empty:
@@ -451,7 +650,6 @@ def artikel_df():
             lambda r: max(int(r["zielbestand_stueck"]) - int(r["verfuegbar_stueck"]), 0),
             axis=1,
         )
-
     return df
 
 
@@ -693,146 +891,6 @@ def setze_artikel_alternativen(artikel_id: int, alternative_ids: list):
                 INSERT OR IGNORE INTO artikel_alternativen (artikel_id, alternativ_artikel_id)
                 VALUES (?, ?)
             """, (int(artikel_id), int(alt_id)))
-    conn.commit()
-    conn.close()
-
-
-# -------------------------------------------------
-# Kunden
-# -------------------------------------------------
-def kunde_registrieren(
-    firmenname,
-    anrede,
-    vorname,
-    nachname,
-    email,
-    telefon,
-    strasse,
-    plz,
-    ort,
-    passwort
-):
-    conn = get_connection()
-    cur = conn.cursor()
-    zeit = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    kunden_nr = f"K-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-
-    cur.execute("""
-        INSERT INTO kunden (
-            kunden_nr, firmenname, anrede, vorname, nachname, email, telefon,
-            strasse, plz, ort, passwort_hash, erstellt_am, ist_aktiv
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-    """, (
-        kunden_nr,
-        firmenname.strip(),
-        anrede.strip(),
-        vorname.strip(),
-        nachname.strip(),
-        email.strip().lower(),
-        telefon.strip(),
-        strasse.strip(),
-        plz.strip(),
-        ort.strip(),
-        hash_password(passwort),
-        zeit
-    ))
-
-    kunden_id = cur.lastrowid
-    for lager in LAGER:
-        cur.execute("""
-            INSERT INTO kunden_lager_freigaben (kunden_id, lager, erlaubt)
-            VALUES (?, ?, 1)
-        """, (kunden_id, lager))
-
-    conn.commit()
-    conn.close()
-    return kunden_nr
-
-
-def kunde_login(email: str, passwort: str):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT *
-        FROM kunden
-        WHERE lower(email) = ? AND passwort_hash = ? AND ist_aktiv = 1
-    """, (email.strip().lower(), hash_password(passwort)))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def hole_alle_kunden():
-    conn = get_connection()
-    df = pd.read_sql_query("""
-        SELECT id, kunden_nr, firmenname, anrede, vorname, nachname, email, telefon,
-               strasse, plz, ort, erstellt_am, ist_aktiv
-        FROM kunden
-        ORDER BY nachname, vorname
-    """, conn)
-    conn.close()
-    return df
-
-
-def hole_kunde_by_id(kunden_id: int):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM kunden WHERE id = ?", (kunden_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def hole_erlaubte_lager_fuer_kunde(kunden_id: int):
-    conn = get_connection()
-    df = pd.read_sql_query("""
-        SELECT lager
-        FROM kunden_lager_freigaben
-        WHERE kunden_id = ? AND erlaubt = 1
-        ORDER BY lager
-    """, conn, params=(kunden_id,))
-    conn.close()
-    return df["lager"].tolist()
-
-
-def setze_lagerfreigaben_fuer_kunde(kunden_id: int, erlaubte_lager: list):
-    conn = get_connection()
-    cur = conn.cursor()
-    for lager in LAGER:
-        erlaubt = 1 if lager in erlaubte_lager else 0
-        cur.execute("""
-            INSERT INTO kunden_lager_freigaben (kunden_id, lager, erlaubt)
-            VALUES (?, ?, ?)
-            ON CONFLICT(kunden_id, lager)
-            DO UPDATE SET erlaubt = excluded.erlaubt
-        """, (kunden_id, lager, erlaubt))
-    conn.commit()
-    conn.close()
-
-
-def kunde_passwort_aendern(kunden_id: int, altes_passwort: str, neues_passwort: str):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT passwort_hash FROM kunden WHERE id = ?", (kunden_id,))
-    row = cur.fetchone()
-
-    if row is None:
-        conn.close()
-        raise ValueError("Kunde wurde nicht gefunden.")
-    if row["passwort_hash"] != hash_password(altes_passwort):
-        conn.close()
-        raise ValueError("Das aktuelle Passwort ist falsch.")
-
-    cur.execute("UPDATE kunden SET passwort_hash = ? WHERE id = ?", (hash_password(neues_passwort), kunden_id))
-    conn.commit()
-    conn.close()
-
-
-def kunde_passwort_admin_reset(kunden_id: int, neues_passwort: str):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE kunden SET passwort_hash = ? WHERE id = ?", (hash_password(neues_passwort), kunden_id))
     conn.commit()
     conn.close()
 
@@ -1243,22 +1301,84 @@ def generate_pdf_kommissionierliste(bestellung, positionen):
     return pdf
 
 
-# -------------------------------------------------
-# Interne Benutzer
-# -------------------------------------------------
-def hole_interne_benutzer():
-    conn = get_connection()
-    df = pd.read_sql_query("""
-        SELECT id, username, rolle, erstellt_am, ist_aktiv
-        FROM internal_users
-        ORDER BY rolle, username
-    """, conn)
-    conn.close()
-    return df
+def generate_pdf_nachbestellvorschlag(nach_df: pd.DataFrame):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=15 * mm,
+        leftMargin=15 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("<b>NACHBESTELLVORSCHLAG</b>", styles["Title"]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(f"Erstellt am: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    if nach_df.empty:
+        story.append(Paragraph("Aktuell ist keine Nachbestellung erforderlich.", styles["Normal"]))
+        doc.build(story)
+        pdf = buffer.getvalue()
+        buffer.close()
+        return pdf
+
+    gruppiert = nach_df.copy()
+    gruppiert["lieferant_group"] = gruppiert["lieferant"].fillna("").replace("", "Ohne Lieferant")
+
+    for lieferant, gruppe in gruppiert.groupby("lieferant_group"):
+        story.append(Paragraph(f"<b>Lieferant: {lieferant}</b>", styles["Heading2"]))
+        story.append(Spacer(1, 4))
+
+        data = [[
+            "Artikelnummer",
+            "Lief.-Art.-Nr.",
+            "Bezeichnung",
+            "Lager",
+            "Platz",
+            "Verfügbar",
+            "Zielbestand",
+            "Nachbestellmenge",
+        ]]
+
+        for _, row in gruppe.iterrows():
+            data.append([
+                str(row["artikelnummer"]),
+                str(row["lieferanten_artikelnummer"] or ""),
+                str(row["name"]),
+                str(row["lager"]),
+                str(row["lagerplatz"] or ""),
+                str(row["verfuegbar_stueck"]),
+                str(row["zielbestand_stueck"]),
+                str(row["nachbestellmenge_stueck"]),
+            ])
+
+        table = Table(
+            data,
+            colWidths=[23 * mm, 24 * mm, 45 * mm, 22 * mm, 20 * mm, 18 * mm, 20 * mm, 28 * mm]
+        )
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#ddebf7")),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("PADDING", (0, 0), (-1, -1), 4),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(table)
+        story.append(Spacer(1, 10))
+
+    doc.build(story)
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
 
 
 # -------------------------------------------------
-# Bestands- und Einkaufslisten
+# Listen / Auswertungen
 # -------------------------------------------------
 def kritische_artikel_df():
     df = artikel_df()
@@ -1290,11 +1410,24 @@ def nachbestellliste_df():
     return df.sort_values(by=["lieferant", "lager", "lagerplatz", "name"], ascending=[True, True, True, True])
 
 
+def lieferantenuebersicht_df():
+    df = artikel_df()
+    if df.empty:
+        return df
+    df["lieferant_group"] = df["lieferant"].fillna("").replace("", "Ohne Lieferant")
+    gruppiert = df.groupby("lieferant_group").agg(
+        artikel_anzahl=("id", "count"),
+        kritische_artikel=("bestandsstatus", lambda s: int((s != "OK").sum())),
+        gesamt_empf_nachbestellung=("empf_nachbestellmenge_stueck", "sum"),
+    ).reset_index()
+    return gruppiert.sort_values(by=["lieferant_group"])
+
+
 # -------------------------------------------------
 # Login Views
 # -------------------------------------------------
 def zeige_start_login():
-    st.title("📦 Lagerwirtschaft Version 3.0")
+    st.title("📦 Lagerwirtschaft Version 3.1")
     st.write("Bitte zuerst einloggen.")
 
     tab1, tab2 = st.tabs(["Interner Login", "Kunden Login / Registrierung"])
@@ -1376,8 +1509,12 @@ def zeige_lagerbestand():
     require_role("Admin", "Lagerist", "Vertrieb")
     st.subheader("Lagerbestand")
 
+    suchtext = st.text_input(
+        "Artikel suchen / Barcode scannen",
+        placeholder="Artikelnummer, Name, EAN/Barcode, Lagerplatz, Lieferant"
+    )
+
     df = artikel_df()
-    suchtext = st.text_input("Artikel suchen", placeholder="Artikelnummer, Name, Hersteller, Barcode, Lagerplatz, Lieferant")
     df = suche_artikel_df(df, suchtext)
 
     lager_filter = st.selectbox("Unterlager filtern", ["Alle"] + LAGER)
@@ -1456,11 +1593,13 @@ def zeige_nachbestellliste():
 
     anzeigen = df[[
         "lieferant", "artikelnummer", "lieferanten_artikelnummer", "name", "hersteller",
-        "lager", "lagerplatz", "verfuegbar_stueck", "zielbestand_stueck", "nachbestellmenge_stueck", "bestandsstatus"
+        "ean_barcode", "lager", "lagerplatz", "verfuegbar_stueck", "zielbestand_stueck",
+        "nachbestellmenge_stueck", "warnstatus"
     ]].copy()
     anzeigen.columns = [
         "Lieferant", "Artikelnummer", "Lief.-Art.-Nr.", "Bezeichnung", "Hersteller",
-        "Lager", "Lagerplatz", "Verfügbar Stück", "Zielbestand", "Empf. Nachbestellmenge", "Warnstatus"
+        "EAN / Barcode", "Lager", "Lagerplatz", "Verfügbar Stück", "Zielbestand",
+        "Empf. Nachbestellmenge", "Warnstatus"
     ]
 
     st.dataframe(anzeigen, use_container_width=True)
@@ -1473,6 +1612,44 @@ def zeige_nachbestellliste():
         mime="text/csv"
     )
 
+    pdf = generate_pdf_nachbestellvorschlag(df)
+    pdf_download_button(
+        pdf,
+        f"nachbestellvorschlag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+        "📄 PDF-Nachbestellvorschlag herunterladen"
+    )
+
+
+def zeige_lieferantenuebersicht():
+    require_role("Admin", "Lagerist", "Vertrieb")
+    st.subheader("Lieferantenübersicht")
+
+    df = lieferantenuebersicht_df()
+    if df.empty:
+        st.info("Keine Artikel vorhanden.")
+        return
+
+    anzeigen = df.copy()
+    anzeigen.columns = ["Lieferant", "Artikelanzahl", "Kritische Artikel", "Gesamt empf. Nachbestellung"]
+    st.dataframe(anzeigen, use_container_width=True)
+
+    artikel = artikel_df()
+    artikel["lieferant_group"] = artikel["lieferant"].fillna("").replace("", "Ohne Lieferant")
+
+    auswahl = st.selectbox("Lieferant auswählen", anzeigen["Lieferant"].tolist())
+    detail = artikel[artikel["lieferant_group"] == auswahl].copy()
+
+    if not detail.empty:
+        detail_anzeige = detail[[
+            "artikelnummer", "lieferanten_artikelnummer", "name", "lager", "lagerplatz",
+            "verfuegbar_stueck", "zielbestand_stueck", "empf_nachbestellmenge_stueck", "bestandsstatus"
+        ]].copy()
+        detail_anzeige.columns = [
+            "Artikelnummer", "Lief.-Art.-Nr.", "Bezeichnung", "Lager", "Lagerplatz",
+            "Verfügbar Stück", "Zielbestand", "Empf. Nachbestellmenge", "Status"
+        ]
+        st.dataframe(detail_anzeige, use_container_width=True)
+
 
 def zeige_einkaufsmonitor():
     require_role("Admin", "Lagerist", "Vertrieb")
@@ -1482,7 +1659,8 @@ def zeige_einkaufsmonitor():
     nach_df = nachbestellliste_df()
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Offene Kundenbestellungen", len(bestellungen[bestellungen["status"].isin(["offen", "in_bearbeitung", "kommissioniert", "verladen"])] if not bestellungen.empty else []))
+    offene = len(bestellungen[bestellungen["status"].isin(["offen", "in_bearbeitung", "kommissioniert", "verladen"])]) if not bestellungen.empty else 0
+    c1.metric("Offene Kundenbestellungen", offene)
     c2.metric("Nachbestellartikel", len(nach_df))
     c3.metric("Betroffene Lieferanten", len(nach_df["lieferant"].fillna("").replace("", pd.NA).dropna().unique()) if not nach_df.empty else 0)
     c4.metric("Empf. Nachbestellmenge gesamt", int(nach_df["nachbestellmenge_stueck"].sum()) if not nach_df.empty else 0)
@@ -1505,11 +1683,11 @@ def zeige_einkaufsmonitor():
         if nach_df.empty:
             st.success("Aktuell ist keine Nachbestellung erforderlich.")
         else:
-            for lieferant, gruppe in nach_df.groupby(nach_df["lieferant"].replace("", "Ohne Lieferant")):
+            for lieferant, gruppe in nach_df.groupby(nach_df["lieferant"].fillna("").replace("", "Ohne Lieferant")):
                 st.markdown(f"### Lieferant: {lieferant}")
                 anzeige = gruppe[[
                     "artikelnummer", "lieferanten_artikelnummer", "name", "lager", "lagerplatz",
-                    "verfuegbar_stueck", "zielbestand_stueck", "nachbestellmenge_stueck", "bestandsstatus"
+                    "verfuegbar_stueck", "zielbestand_stueck", "nachbestellmenge_stueck", "warnstatus"
                 ]].copy()
                 anzeige.columns = [
                     "Artikelnummer", "Lief.-Art.-Nr.", "Bezeichnung", "Lager", "Lagerplatz",
@@ -1635,9 +1813,17 @@ def zeige_wareneingang():
     require_role("Admin", "Lagerist")
     st.subheader("Wareneingang buchen")
 
+    suchtext = st.text_input(
+        "Artikel suchen / Barcode scannen",
+        placeholder="Barcode, Artikelnummer, Name, Lagerplatz",
+        key="wareneingang_suche"
+    )
+
     df = artikel_df()
+    df = suche_artikel_df(df, suchtext)
+
     if df.empty:
-        st.warning("Keine Artikel vorhanden.")
+        st.warning("Keine passenden Artikel vorhanden.")
         return
 
     artikel_map = {
@@ -1716,12 +1902,13 @@ def zeige_artikel_bearbeiten_loeschen():
     require_role("Admin", "Lagerist")
     st.subheader("Artikel bearbeiten / löschen")
 
-    df = artikel_df()
-    if df.empty:
-        st.info("Keine Artikel vorhanden.")
-        return
+    suchtext = st.text_input(
+        "Artikel suchen / Barcode scannen",
+        placeholder="Artikelnummer, Name, EAN, Lagerplatz",
+        key="artikel_edit_suche"
+    )
 
-    suchtext = st.text_input("Artikel suchen", placeholder="Artikelnummer, Name, Lager, Barcode, Lagerplatz", key="artikel_edit_suche")
+    df = artikel_df()
     df = suche_artikel_df(df, suchtext)
     if df.empty:
         st.info("Keine Artikel gefunden.")
@@ -2065,7 +2252,11 @@ def zeige_shop():
     sichtbare_artikel = df[df["lager"].isin(erlaubte_lager)].copy()
     st.info("Sichtbar sind nur die für den Kunden freigegebenen Unterlager.")
 
-    suchtext = st.text_input("Artikel suchen", placeholder="Artikelnummer, Name, Hersteller, Lagerplatz", key="shop_suche")
+    suchtext = st.text_input(
+        "Artikel suchen / Barcode scannen",
+        placeholder="Artikelnummer, Name, Barcode, Lagerplatz",
+        key="shop_suche"
+    )
     sichtbare_artikel = suche_artikel_df(sichtbare_artikel, suchtext)
 
     lager_filter = st.selectbox("Lager auswählen", ["Alle"] + erlaubte_lager, key="shop_lager")
@@ -2273,6 +2464,7 @@ def zeige_sidebar_internal():
         "Lagerbestand",
         "Bestandswarnliste",
         "Nachbestellliste",
+        "Lieferantenübersicht",
         "Einkaufsmonitor",
         "Gesamtmonitor",
         "TV-Monitor",
@@ -2307,7 +2499,7 @@ def zeige_sidebar_kunde():
 # Main
 # -------------------------------------------------
 def main():
-    st.set_page_config(page_title="Lagerwirtschaft V3.0", layout="wide")
+    st.set_page_config(page_title="Lagerwirtschaft V3.1", layout="wide")
     init_db()
 
     if "warenkorb" not in st.session_state:
@@ -2335,6 +2527,8 @@ def main():
             zeige_bestandswarnliste()
         elif menue == "Nachbestellliste":
             zeige_nachbestellliste()
+        elif menue == "Lieferantenübersicht":
+            zeige_lieferantenuebersicht()
         elif menue == "Einkaufsmonitor":
             zeige_einkaufsmonitor()
         elif menue == "Gesamtmonitor":
