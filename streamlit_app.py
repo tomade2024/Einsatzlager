@@ -1,8 +1,3 @@
-Hier ist der **vollständige, konsolidierte Python-Code** für deine Lagerwirtschaft (Version 3.4). Ich habe alle Funktionen (V3.2 Stammdaten + V3.4 Erweiterungen wie Voice, Scanner-Terminal und Safe-Restore) sauber in eine einzige Datei zusammengeführt.
-
-Du kannst diesen Code direkt kopieren und als `lager.py` speichern.
-
-```python
 import hashlib
 import io
 import json
