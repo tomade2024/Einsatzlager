@@ -19,7 +19,7 @@ from reportlab.pdfgen import canvas
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 # --- KONFIGURATION ---
-DB_FILE = "lager_v34.db"
+DB_FILE = "lager_v35.db"
 BACKUP_DIR = "backups"
 
 LAGER = ["Medizinlager", "Verbrauchslager", "Materiallager", "Techniklager", "Möbellager", "Lebensmittellager", "Textillager"]
@@ -27,17 +27,13 @@ ROLLEN = ["Admin", "Lagerist", "Vertrieb"]
 BESTELLSTATUS = ["offen", "in_bearbeitung", "kommissioniert", "verladen", "geliefert", "storniert"]
 
 MENU_LABELS = {
+    "dashboard": "📊 Gesamt-Monitor",
     "lagerbestand": "📦 Lagerbestand",
     "scanner_terminal": "🚀 Scanner-Terminal",
-    "bestellungen": "📋 Bestellungen & Picking",
+    "bestellungen": "📋 Picking / Aufträge",
     "wareneingang": "📥 Wareneingang",
-    "chargen_mhd": "🏷️ Chargen / MHD",
-    "bestandswarnliste": "⚠️ Warnliste",
-    "nachbestellliste": "🛒 Nachbestellliste",
-    "artikel_anlegen": "➕ Artikel anlegen",
-    "artikel_bearbeiten": "✏️ Bearbeiten / Löschen",
-    "kundenverwaltung": "👥 Kundenverwaltung",
-    "benutzerverwaltung": "🔐 Benutzerverwaltung",
+    "kundenverwaltung": "👥 Kundenverwaltung (Admin)",
+    "benutzerverwaltung": "🔐 Benutzerverwaltung (Admin)",
     "backup": "💾 Backup & Restore",
 }
 
@@ -47,28 +43,18 @@ MENU_LABELS = {
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
-def get_now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
 def apply_mobile_styles():
     st.markdown("""
         <style>
-            .stButton > button { width: 100%; height: 70px; font-size: 20px !important; border-radius: 15px; font-weight: bold; }
-            .stTextInput input { height: 60px; font-size: 22px !important; }
-            .pos-card { padding: 20px; border-radius: 12px; border-left: 8px solid #1f77b4; background: #f0f2f6; margin-bottom: 15px; }
+            .stButton > button { width: 100%; height: 60px; font-size: 18px !important; border-radius: 12px; font-weight: bold; }
+            .pos-card { padding: 15px; border-radius: 10px; border-left: 5px solid #1f77b4; background: #f9f9f9; margin-bottom: 10px; box-shadow: 2px 2px 5px rgba(0,0,0,0.05); }
+            .monitor-box { padding: 20px; border-radius: 10px; color: white; text-align: center; margin-bottom: 10px; }
         </style>
     """, unsafe_allow_html=True)
 
 def speak(text):
     if text:
-        components.html(f"""
-            <script>
-                window.speechSynthesis.cancel();
-                var msg = new SpeechSynthesisUtterance('{text}');
-                msg.lang = 'de-DE';
-                window.speechSynthesis.speak(msg);
-            </script>
-        """, height=0)
+        components.html(f"<script>window.speechSynthesis.cancel(); var msg = new SpeechSynthesisUtterance('{text}'); msg.lang = 'de-DE'; window.speechSynthesis.speak(msg);</script>", height=0)
 
 # -------------------------------------------------
 # Datenbank-Kernfunktionen
@@ -84,193 +70,157 @@ def init_db():
     cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     cur.execute("""CREATE TABLE IF NOT EXISTS artikel (
         id INTEGER PRIMARY KEY AUTOINCREMENT, artikelnummer TEXT UNIQUE, name TEXT, lager TEXT, 
-        verpackung_typ TEXT, inhalt_pro_pack INTEGER DEFAULT 10, packs_pro_palette INTEGER DEFAULT 10, 
-        bestand_stueck INTEGER DEFAULT 0, reserviert_stueck INTEGER DEFAULT 0,
-        mindestbestand_stueck INTEGER DEFAULT 0, meldebestand_stueck INTEGER DEFAULT 0, 
-        zielbestand_stueck INTEGER DEFAULT 0, ean_barcode TEXT, hersteller TEXT, einheit TEXT DEFAULT 'Stück',
-        lagerplatz TEXT, nachschub_lagerplatz TEXT, lieferant TEXT, lieferanten_artikelnummer TEXT
+        bestand_stueck INTEGER DEFAULT 0, meldebestand_stueck INTEGER DEFAULT 10, zielbestand_stueck INTEGER DEFAULT 50,
+        ean_barcode TEXT, lagerplatz TEXT
     )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS artikel_chargen (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, artikel_id INTEGER, chargennummer TEXT, 
-        chargenbarcode TEXT UNIQUE, mhd_datum TEXT, ausgabe_bis TEXT, bestand_stueck INTEGER DEFAULT 0, 
-        lagerplatz TEXT, nachschub_lagerplatz TEXT, wareneingang_datum TEXT
+    cur.execute("""CREATE TABLE IF NOT EXISTS kunden (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, kunden_nr TEXT UNIQUE, name TEXT, email TEXT, passwort_hash TEXT, aktiv INTEGER DEFAULT 1
     )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS kommissionierung_details (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, bestellposition_id INTEGER, charge_id INTEGER, 
-        menge_kommissioniert INTEGER, zeitpunkt TEXT
+    cur.execute("""CREATE TABLE IF NOT EXISTS internal_users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, passwort_hash TEXT, rolle TEXT, ist_aktiv INTEGER DEFAULT 1
     )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS bestellungen (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, bestellnummer TEXT, kunden_id INTEGER, kunde_name TEXT, 
-        lieferadresse TEXT, datum TEXT, uhrzeit TEXT, status TEXT DEFAULT 'offen', status_geaendert_am TEXT
+        id INTEGER PRIMARY KEY AUTOINCREMENT, bestellnummer TEXT, kunden_id INTEGER, status TEXT DEFAULT 'offen', datum TEXT
     )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS bestellpositionen (
         id INTEGER PRIMARY KEY AUTOINCREMENT, bestellung_id INTEGER, artikel_id INTEGER, menge_stueck INTEGER
     )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS internal_users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, passwort_hash TEXT, 
-        rolle TEXT, menu_rights_json TEXT, erstellt_am TEXT, ist_aktiv INTEGER DEFAULT 1
+    cur.execute("""CREATE TABLE IF NOT EXISTS kommissionierung_details (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, bestellposition_id INTEGER, menge_kommissioniert INTEGER, zeitpunkt TEXT
     )""")
-    
+    # Admin & Test-Daten
     cur.execute("SELECT COUNT(*) FROM internal_users")
     if cur.fetchone()[0] == 0:
-        cur.execute("INSERT INTO internal_users (username, passwort_hash, rolle, erstellt_am) VALUES (?,?,?,?)",
-                    ("admin", hash_password("admin123"), "Admin", get_now_str()))
+        cur.execute("INSERT INTO internal_users (username, passwort_hash, rolle) VALUES (?,?,?)", ("admin", hash_password("admin123"), "Admin"))
     conn.commit()
     conn.close()
 
 # -------------------------------------------------
-# Backup & Restore Logic
+# Monitor / Dashboard Logik
 # -------------------------------------------------
-def create_backup_db() -> str:
-    Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = os.path.join(BACKUP_DIR, f"backup_{ts}.db")
-    with sqlite3.connect(DB_FILE) as src, sqlite3.connect(path) as dst:
-        src.backup(dst)
-    return path
-
-def restore_backup_safe(backup_path: str):
-    safety = create_backup_db().replace("backup_", "SAFETY_BEFORE_RESTORE_")
-    with sqlite3.connect(backup_path) as src, sqlite3.connect(DB_FILE) as dst:
-        src.backup(dst)
-    return safety
-
-# -------------------------------------------------
-# Business Logic (Picking & Inventory)
-# -------------------------------------------------
-def buche_teilkommissionierung(bestellpos_id, charge_id, menge):
+def zeige_dashboard():
+    st.title("📊 Logistik-Monitor")
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO kommissionierung_details (bestellposition_id, charge_id, menge_kommissioniert, zeitpunkt) VALUES (?,?,?,?)",
-                (bestellpos_id, charge_id, menge, get_now_str()))
-    conn.commit()
+    
+    # 1. Bestands-Monitor (Einkauf)
+    st.subheader("🛒 Einkaufs-Monitor")
+    df_art = pd.read_sql_query("SELECT name, bestand_stueck, meldebestand_stueck, zielbestand_stueck FROM artikel", conn)
+    muss_bestellt_werden = df_art[df_art['bestand_stueck'] <= df_art['meldebestand_stueck']]
+    
+    c1, c2 = st.columns(2)
+    with c1:
+        st.error(f"Kritisch: {len(muss_bestellt_werden)} Artikel unter Meldebestand")
+        if not muss_bestellt_werden.empty:
+            st.dataframe(muss_bestellt_werden[['name', 'bestand_stueck', 'zielbestand_stueck']], use_container_width=True)
+    with c2:
+        offene_bestellungen = pd.read_sql_query("SELECT bestellnummer, status FROM bestellungen WHERE status='offen'", conn)
+        st.info(f"Offene Kundenaufträge: {len(offene_bestellungen)}")
+        st.dataframe(offene_bestellungen, use_container_width=True)
+
+    st.divider()
+
+    # 2. Kommissionier-Monitor
+    st.subheader("📦 Kommissionier-Status")
+    bestell_df = pd.read_sql_query("SELECT id, bestellnummer, status FROM bestellungen", conn)
+    
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        st.markdown("<div class='monitor-box' style='background-color: #ff4b4b;'><h3>Neu / Offen</h3></div>", unsafe_allow_html=True)
+        neu = bestell_df[bestell_df['status'] == 'offen']
+        st.write(neu[['bestellnummer']])
+    with k2:
+        st.markdown("<div class='monitor-box' style='background-color: #ffa500;'><h3>In Bearbeitung</h3></div>", unsafe_allow_html=True)
+        laufend = bestell_df[bestell_df['status'] == 'in_bearbeitung']
+        st.write(laufend[['bestellnummer']])
+    with k3:
+        st.markdown("<div class='monitor-box' style='background-color: #28a745;'><h3>Fertig</h3></div>", unsafe_allow_html=True)
+        fertig = bestell_df[bestell_df['status'] == 'kommissioniert']
+        st.write(fertig[['bestellnummer']])
     conn.close()
 
-def hole_offene_bestellpositionen(bestell_id):
+# -------------------------------------------------
+# Kunden- & Benutzerverwaltung (Admin)
+# -------------------------------------------------
+def zeige_kundenverwaltung():
+    st.subheader("👥 Kundenverwaltung")
+    with st.expander("➕ Neuen Kunden anlegen"):
+        with st.form("neuer_kunde"):
+            k_nr = st.text_input("Kundennummer (z.B. K1000)")
+            k_name = st.text_input("Name / Firma")
+            k_email = st.text_input("Email")
+            k_pw = st.text_input("Passwort", type="password")
+            if st.form_submit_button("Kunde speichern"):
+                conn = get_connection()
+                try:
+                    conn.execute("INSERT INTO kunden (kunden_nr, name, email, passwort_hash) VALUES (?,?,?,?)",
+                                 (k_nr, k_name, k_email, hash_password(k_pw)))
+                    conn.commit()
+                    st.success(f"Kunde {k_name} angelegt!")
+                except: st.error("Fehler: Kundennummer oder Email existiert bereits.")
+                finally: conn.close()
+    
     conn = get_connection()
-    df = pd.read_sql_query("""
-        SELECT bp.id as pos_id, a.name, a.lagerplatz, a.artikelnummer, bp.menge_stueck as soll,
-        COALESCE(SUM(kd.menge_kommissioniert), 0) as ist
-        FROM bestellpositionen bp
-        JOIN artikel a ON a.id = bp.artikel_id
-        LEFT JOIN kommissionierung_details kd ON kd.bestellposition_id = bp.id
-        WHERE bp.bestellung_id = ?
-        GROUP BY bp.id
-    """, conn, params=(bestell_id,))
+    kunden = pd.read_sql_query("SELECT kunden_nr, name, email, aktiv FROM kunden", conn)
+    st.dataframe(kunden, use_container_width=True)
     conn.close()
-    return df[df['ist'] < df['soll']]
 
-def hole_bestellungen():
+def zeige_benutzerverwaltung():
+    st.subheader("🔐 Interne Benutzerverwaltung")
+    with st.expander("➕ Neuen internen Benutzer anlegen"):
+        with st.form("neuer_user"):
+            u_name = st.text_input("Benutzername")
+            u_rolle = st.selectbox("Rolle", ROLLEN)
+            u_pw = st.text_input("Passwort", type="password")
+            if st.form_submit_button("Benutzer speichern"):
+                conn = get_connection()
+                try:
+                    conn.execute("INSERT INTO internal_users (username, passwort_hash, rolle) VALUES (?,?,?)",
+                                 (u_name, hash_password(u_pw), u_rolle))
+                    conn.commit()
+                    st.success(f"Benutzer {u_name} angelegt!")
+                except: st.error("Benutzername existiert bereits.")
+                finally: conn.close()
+    
     conn = get_connection()
-    df = pd.read_sql_query("SELECT * FROM bestellungen ORDER BY id DESC", conn)
+    users = pd.read_sql_query("SELECT username, rolle, ist_aktiv FROM internal_users", conn)
+    st.dataframe(users, use_container_width=True)
     conn.close()
-    return df
 
 # -------------------------------------------------
-# UI Ansichten
-# -------------------------------------------------
-def zeige_scanner_terminal():
-    apply_mobile_styles()
-    st.subheader("🚀 Scanner Terminal")
-    mode = st.radio("Aktion wählen", ["📥 Wareneingang", "📤 Picking"], horizontal=True)
-    scan_val = st.text_input("Barcode scannen...", key="terminal_scan")
-    
-    if scan_val:
-        conn = get_connection()
-        cur = conn.cursor()
-        if mode == "📥 Wareneingang":
-            cur.execute("SELECT * FROM artikel WHERE ean_barcode = ? OR artikelnummer = ?", (scan_val, scan_val))
-            art = cur.fetchone()
-            if art:
-                speak(f"{art['name']} erkannt.")
-                st.markdown(f"<div class='pos-card'><b>{art['name']}</b><br>Platz: {art['lagerplatz']}</div>", unsafe_allow_html=True)
-                if st.button("➕ 1 Einheit buchen"): st.success("Gebucht")
-            else: speak("Unbekannter Artikel")
-        else:
-            cur.execute("SELECT c.*, a.name FROM artikel_chargen c JOIN artikel a ON a.id = c.artikel_id WHERE c.chargenbarcode = ?", (scan_val,))
-            ch = cur.fetchone()
-            if ch:
-                speak(f"{ch['name']} bestätigt.")
-                if st.button("➖ Entnahme bestätigen"): st.warning("Ausgebucht")
-            else: speak("Charge unbekannt")
-
-def zeige_bestellungen_picking():
-    st.subheader("📋 Picking & Kommissionierung")
-    bestellungen = hole_bestellungen()
-    if bestellungen.empty:
-        st.info("Keine Bestellungen vorhanden.")
-        return
-
-    auswahl = st.selectbox("Bestellung wählen", [f"{r['bestellnummer']} - {r['kunde_name']}" for _, r in bestellungen.iterrows()])
-    b_no = auswahl.split(" - ")[0]
-    b_id = bestellungen[bestellungen['bestellnummer'] == b_no].iloc[0]['id']
-    
-    apply_mobile_styles()
-    offen = hole_offene_bestellpositionen(b_id)
-    
-    if offen.empty:
-        st.success("Bestellung vollständig!")
-    else:
-        akt = offen.iloc[0]
-        st.markdown(f"<div class='pos-card'><h1>Platz: {akt['lagerplatz']}</h1><h2>{akt['name']}</h2><p>Menge offen: {int(akt['soll']-akt['ist'])}</p></div>", unsafe_allow_html=True)
-        speak(f"Gehe zu {akt['lagerplatz']}. Nimm {int(akt['soll']-akt['ist'])} Stück.")
-        if st.button("✅ Position Erledigt"):
-            buche_teilkommissionierung(akt['pos_id'], 0, akt['soll'] - akt['ist'])
-            st.rerun()
-
-def zeige_backup_restore():
-    st.subheader("💾 Backup & Restore")
-    if st.button("Jetzt Sicherung erstellen"):
-        path = create_backup_db()
-        st.success(f"Gesichert: {os.path.basename(path)}")
-    
-    backups = sorted(Path(BACKUP_DIR).glob("*.db"), reverse=True)
-    if backups:
-        sel = st.selectbox("Wähle Restore-Punkt", [b.name for b in backups])
-        if st.button("Wiederherstellen (Sicherer Modus)"):
-            safety = restore_backup_safe(os.path.join(BACKUP_DIR, sel))
-            st.warning(f"Notfall-Kopie erstellt: {os.path.basename(safety)}")
-            st.success("Wiederherstellung erfolgreich!")
-            st.rerun()
-
-# -------------------------------------------------
-# Main Navigation & Login
+# Main Navigation
 # -------------------------------------------------
 def main():
-    st.set_page_config(page_title="Lager Pro V3.4", layout="wide")
+    st.set_page_config(page_title="Einsatzlager Pro 2026", layout="wide")
     init_db()
+    apply_mobile_styles()
     
     if "internal_logged_in" not in st.session_state:
         st.session_state.internal_logged_in = False
 
     if not st.session_state.internal_logged_in:
-        st.title("📦 Lager Pro Login")
-        with st.form("login_form"):
-            u = st.text_input("Benutzername")
+        st.title("📦 Lagerwirtschaft Login")
+        with st.form("login"):
+            u = st.text_input("Benutzer")
             p = st.text_input("Passwort", type="password")
-            if st.form_submit_button("Anmelden"):
+            if st.form_submit_button("Login"):
                 conn = get_connection()
-                user = conn.execute("SELECT * FROM internal_users WHERE username=? AND passwort_hash=?", 
-                                   (u, hash_password(p))).fetchone()
+                user = conn.execute("SELECT * FROM internal_users WHERE username=? AND passwort_hash=?", (u, hash_password(p))).fetchone()
                 if user:
                     st.session_state.internal_logged_in = True
                     st.session_state.internal_user = dict(user)
                     st.rerun()
-                else: st.error("Daten falsch.")
+                else: st.error("Login fehlgeschlagen")
         return
 
-    menu_choice = st.sidebar.radio("Navigation", list(MENU_LABELS.values()))
+    # Navigation
+    menu = st.sidebar.radio("Navigation", list(MENU_LABELS.values()))
     
-    if menu_choice == MENU_LABELS["scanner_terminal"]:
-        zeige_scanner_terminal()
-    elif menu_choice == MENU_LABELS["bestellungen"]:
-        zeige_bestellungen_picking()
-    elif menu_choice == MENU_LABELS["backup"]:
-        zeige_backup_restore()
-    else:
-        st.info(f"Der Bereich '{menu_choice}' wird in Kürze geladen.")
+    if menu == MENU_LABELS["dashboard"]: zeige_dashboard()
+    elif menu == MENU_LABELS["kundenverwaltung"]: zeige_kundenverwaltung()
+    elif menu == MENU_LABELS["benutzerverwaltung"]: zeige_benutzerverwaltung()
+    # Hier folgen die restlichen Platzhalter...
+    else: st.info(f"Bereich {menu} wird geladen...")
 
-    st.sidebar.divider()
     if st.sidebar.button("Abmelden"):
         st.session_state.clear()
         st.rerun()
