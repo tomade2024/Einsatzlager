@@ -115,4 +115,150 @@ def init_db():
     cur.execute("SELECT COUNT(*) FROM internal_users")
     if cur.fetchone()[0] == 0:
         cur.execute("INSERT INTO internal_users (username, passwort_hash, rolle, erstellt_am) VALUES (?,?,?,?)",
-                    ("admin", hash
+                    ("admin", hash_password("admin123"), "Admin", get_now_str()))
+    conn.commit()
+    conn.close()
+
+# -------------------------------------------------
+# Backup & Safe-Restore
+# -------------------------------------------------
+def create_backup_db() -> str:
+    Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = os.path.join(BACKUP_DIR, f"backup_{ts}.db")
+    with sqlite3.connect(DB_FILE) as src:
+        with sqlite3.connect(path) as dst:
+            src.backup(dst)
+    return path
+
+def restore_backup_safe(backup_path: str):
+    safety = create_backup_db().replace("backup_", "SAFETY_BEFORE_RESTORE_")
+    with sqlite3.connect(backup_path) as src:
+        with sqlite3.connect(DB_FILE) as dst:
+            src.backup(dst)
+    return safety
+
+# -------------------------------------------------
+# Scanner & Picking Logik
+# -------------------------------------------------
+def buche_teilkommissionierung(bestellpos_id, charge_id, menge):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO kommissionierung_details (bestellposition_id, charge_id, menge_kommissioniert, zeitpunkt) VALUES (?,?,?,?)",
+                (bestellpos_id, charge_id, menge, get_now_str()))
+    conn.commit()
+    conn.close()
+
+def hole_offene_bestellpositionen(bestell_id):
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT bp.id as pos_id, a.name, a.lagerplatz, a.artikelnummer, bp.menge_stueck as soll,
+        COALESCE(SUM(kd.menge_kommissioniert), 0) as ist
+        FROM bestellpositionen bp
+        JOIN artikel a ON a.id = bp.artikel_id
+        LEFT JOIN kommissionierung_details kd ON kd.bestellposition_id = bp.id
+        WHERE bp.bestellung_id = ?
+        GROUP BY bp.id
+    """, conn, params=(bestell_id,))
+    conn.close()
+    return df[df['ist'] < df['soll']]
+
+def hole_bestellungen():
+    conn = get_connection()
+    df = pd.read_sql_query("SELECT * FROM bestellungen ORDER BY id DESC", conn)
+    conn.close()
+    return df
+
+# -------------------------------------------------
+# UI SEKTIONEN
+# -------------------------------------------------
+def zeige_scanner_terminal():
+    apply_mobile_styles()
+    st.subheader("🚀 Scanner Terminal")
+    mode = st.radio("Aktion wählen", ["📥 Wareneingang", "📤 Picking"], horizontal=True)
+    scan_val = st.text_input("Barcode scannen...", key="terminal_scan")
+    
+    if scan_val:
+        conn = get_connection()
+        cur = conn.cursor()
+        if mode == "📥 Wareneingang":
+            cur.execute("SELECT * FROM artikel WHERE ean_barcode = ? OR artikelnummer = ?", (scan_val, scan_val))
+            art = cur.fetchone()
+            if art:
+                speak(f"{art['name']} erkannt.")
+                st.markdown(f"<div class='pos-card'><b>{art['name']}</b><br>Platz: {art['lagerplatz']}</div>", unsafe_allow_html=True)
+                if st.button("➕ 1 Einheit buchen"): 
+                    st.success("Gebucht")
+            else: 
+                speak("Unbekannter Artikel")
+        else:
+            cur.execute("SELECT c.*, a.name FROM artikel_chargen c JOIN artikel a ON a.id = c.artikel_id WHERE c.chargenbarcode = ?", (scan_val,))
+            ch = cur.fetchone()
+            if ch:
+                speak(f"{ch['name']} bestätigt.")
+                if st.button("➖ Entnahme bestätigen"): 
+                    st.warning("Ausgebucht")
+            else: 
+                speak("Charge unbekannt")
+
+def zeige_bestellungen_picking():
+    st.subheader("📋 Picking & Kommissionierung")
+    bestellungen = hole_bestellungen()
+    if bestellungen.empty:
+        st.info("Keine Bestellungen vorhanden.")
+        return
+
+    auswahl = st.selectbox("Bestellung wählen", [f"{r['bestellnummer']} - {r['kunde_name']}" for _, r in bestellungen.iterrows()])
+    b_no = auswahl.split(" - ")[0]
+    b_id = bestellungen[bestellungen['bestellnummer'] == b_no].iloc[0]['id']
+    
+    apply_mobile_styles()
+    offen = hole_offene_bestellpositionen(b_id)
+    
+    if offen.empty:
+        st.success("Bestellung vollständig!")
+    else:
+        akt = offen.iloc[0]
+        st.markdown(f"<div class='pos-card'><h1>Platz: {akt['lagerplatz']}</h1><h2>{akt['name']}</h2><p>Menge: {int(akt['soll']-akt['ist'])}</p></div>", unsafe_allow_html=True)
+        speak(f"Gehe zu {akt['lagerplatz']}. Nimm {int(akt['soll']-akt['ist'])} Stück.")
+        if st.button("✅ Position Erledigt"):
+            buche_teilkommissionierung(akt['pos_id'], 0, akt['soll'] - akt['ist'])
+            st.rerun()
+
+def zeige_backup_restore():
+    st.subheader("💾 Backup & Restore")
+    if st.button("Jetzt Sicherung erstellen"):
+        path = create_backup_db()
+        st.success(f"Gesichert: {os.path.basename(path)}")
+    
+    backups = sorted(Path(BACKUP_DIR).glob("*.db"), reverse=True)
+    if backups:
+        sel = st.selectbox("Wähle Restore-Punkt", [b.name for b in backups])
+        if st.button("Wiederherstellen (Sicherer Modus)"):
+            safety = restore_backup_safe(os.path.join(BACKUP_DIR, sel))
+            st.warning(f"Notfall-Kopie erstellt: {os.path.basename(safety)}")
+            st.success("Wiederherstellung erfolgreich!")
+            st.rerun()
+
+# -------------------------------------------------
+# Main Navigation
+# -------------------------------------------------
+def main():
+    st.set_page_config(page_title="Lager Pro V3.4", layout="wide")
+    init_db()
+    
+    if "internal_logged_in" not in st.session_state:
+        st.session_state.internal_logged_in = False
+
+    if not st.session_state.internal_logged_in:
+        st.title("📦 Lagerwirtschaft Login")
+        u = st.text_input("Benutzer")
+        p = st.text_input("Passwort", type="password")
+        if st.button("Login"):
+            conn = get_connection()
+            user = conn.execute("SELECT * FROM internal_users WHERE username=? AND passwort_hash=?", 
+                               (u, hash_password(p))).fetchone()
+            if user:
+                st.session_state.internal_logged_in = True
+                st.session_state.internal_user = dict(user)
+                st.
