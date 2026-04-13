@@ -1,17 +1,3 @@
-Hier ist die konsolidierte **Version 6.0.1**. Diese Version vereint alle bisherigen Entwicklungsstufen (Stammdaten, Suche, Admin-Tools, Ampel-Monitoring, Lieferscheine mit Logo und Bestandsrevision) in einem sauberen, ausführbaren Code.
-
-### Änderungen in V6.0.1:
-* **Stammdaten-Management:** Artikel können im Lagerbestand direkt editiert werden (Lagerplatz, Name, Meldebestand).
-* **Echtzeit-Suche:** Dynamische Filterung im Lagerbestand nach Name, Platz oder EAN.
-* **Admin-Konsole:** Benutzerverwaltung (Anlegen/Löschen) und Live-Monitor der angemeldeten Mitarbeiter.
-* **Stations-Portal:** Kundenregistrierung mit Krankenhausdaten, Username und Passwort-Verschlüsselung.
-* **Bestands-Revision:** Automatische Korrektur des Regalbestands bei nachträglichen Lieferschein-Änderungen.
-
----
-
-### Der vollständige Code (V6.0.1 - Copy & Paste)
-
-```python
 import hashlib
 import io
 import json
