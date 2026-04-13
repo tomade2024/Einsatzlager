@@ -16,7 +16,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import cm
 
 # --- KONFIGURATION ---
-DB_FILE = "lager_v601.db"
+DB_FILE = "lager_v602.db"
 LOGO_FILE = "image_0.png"
 
 MENU_LABELS = {
@@ -25,6 +25,7 @@ MENU_LABELS = {
     "picking": "📋 Picking & Lieferscheine",
     "lagerbestand": "📦 Lagerbestand",
     "art_anlegen": "➕ Artikel anlegen",
+    "kundenverwaltung": "👥 Kundenverwaltung",
     "benutzerverwaltung": "🔐 Benutzerverwaltung",
     "reporting": "📉 Berichte & Export"
 }
@@ -51,23 +52,20 @@ def get_connection():
 def init_db():
     conn = get_connection()
     cur = conn.cursor()
-    # Artikel
     cur.execute("""CREATE TABLE IF NOT EXISTS artikel (
         id INTEGER PRIMARY KEY AUTOINCREMENT, art_nr TEXT UNIQUE, name TEXT, 
-        einheit TEXT, inhalt_pack INTEGER, inhalt_pal INTEGER, bestand_stk INTEGER DEFAULT 0,
+        einheit TEXT, inhalt_pack INTEGER DEFAULT 10, inhalt_karton INTEGER DEFAULT 100, 
+        inhalt_palette INTEGER DEFAULT 1000, bestand_stk INTEGER DEFAULT 0,
         meldebestand_stk INTEGER DEFAULT 10, lagerplatz TEXT, ean_barcode TEXT
     )""")
-    # Interne Benutzer
     cur.execute("""CREATE TABLE IF NOT EXISTS internal_users (
         id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, 
         passwort_hash TEXT, rolle TEXT, rechte_json TEXT, last_login TEXT, is_online INTEGER DEFAULT 0
     )""")
-    # Kunden (Krankenhäuser/Stationen)
     cur.execute("""CREATE TABLE IF NOT EXISTS kunden (
         id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, passwort_hash TEXT,
         krankenhaus TEXT, station TEXT, adresse TEXT, ansprechpartner TEXT, email TEXT
     )""")
-    # Bestellungen & Positionen
     cur.execute("""CREATE TABLE IF NOT EXISTS bestellungen (
         id INTEGER PRIMARY KEY AUTOINCREMENT, bestellnummer TEXT UNIQUE, kunden_id INTEGER, 
         status TEXT DEFAULT 'offen', datum TEXT, kommissionierer TEXT
@@ -75,13 +73,11 @@ def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS bestellpositionen (
         id INTEGER PRIMARY KEY AUTOINCREMENT, bestellung_id INTEGER, artikel_id INTEGER, menge_stueck INTEGER
     )""")
-    # Historie / Log
     cur.execute("""CREATE TABLE IF NOT EXISTS lager_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT, artikel_id INTEGER, menge INTEGER, 
         typ TEXT, zeitpunkt TEXT, benutzer TEXT
     )""")
     
-    # Standard Admin Initialisierung
     if cur.execute("SELECT COUNT(*) FROM internal_users").fetchone()[0] == 0:
         admin_rechte = json.dumps(list(MENU_LABELS.keys()))
         cur.execute("INSERT INTO internal_users (username, passwort_hash, rolle, rechte_json) VALUES (?,?,?,?)",
@@ -90,49 +86,59 @@ def init_db():
     conn.close()
 
 # -------------------------------------------------
-# Hilfsfunktionen
-# -------------------------------------------------
-def set_online_status(user_id, status):
-    conn = get_connection()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn.execute("UPDATE internal_users SET is_online = ?, last_login = ? WHERE id = ?", (status, now, user_id))
-    conn.commit()
-    conn.close()
-
-def speak(text):
-    if text:
-        components.html(f"<script>window.speechSynthesis.cancel(); var msg = new SpeechSynthesisUtterance('{text}'); msg.lang = 'de-DE'; window.speechSynthesis.speak(msg);</script>", height=0)
-
-# -------------------------------------------------
 # UI SEKTIONEN
 # -------------------------------------------------
 
-def zeige_dashboard():
-    st.header("📊 Gesamt-Monitor")
+def zeige_kundenverwaltung():
+    st.header("👥 Kundenverwaltung (Admin)")
     conn = get_connection()
+    kunden = conn.execute("SELECT * FROM kunden").fetchall()
     
-    # Ampel-System für Kommissionierung
-    offen = conn.execute("SELECT COUNT(*) FROM bestellungen WHERE status='offen'").fetchone()[0]
-    arbeit = conn.execute("SELECT COUNT(*) FROM bestellungen WHERE status='in_bearbeitung'").fetchone()[0]
-    fertig = conn.execute("SELECT COUNT(*) FROM bestellungen WHERE status='kommissioniert'").fetchone()[0]
-    
-    c1, c2, c3 = st.columns(3)
-    c1.metric("🔴 OFFEN", offen)
-    c2.metric("🟡 IN ARBEIT", arbeit)
-    c3.metric("🟢 ERLEDIGT", fertig)
-    
-    st.divider()
-    st.subheader("👥 Online-Status Mitarbeiter")
-    online = conn.execute("SELECT username, rolle FROM internal_users WHERE is_online=1").fetchall()
-    if online:
-        for u in online: st.success(f"Aktiv: {u['username']} ({u['rolle']})")
-    else: st.info("Keine Mitarbeiter online.")
+    for k in kunden:
+        with st.expander(f"Station: {k['station']} ({k['krankenhaus']})"):
+            with st.form(f"edit_kunde_{k['id']}"):
+                n_kh = st.text_input("Krankenhaus Name", value=k['krankenhaus'])
+                n_st = st.text_input("Station Name", value=k['station'])
+                n_pw = st.text_input("Passwort Reset (leer lassen für keine Änderung)", type="password")
+                if st.form_submit_button("Änderungen speichern"):
+                    if n_pw:
+                        conn.execute("UPDATE kunden SET krankenhaus=?, station=?, passwort_hash=? WHERE id=?", 
+                                     (n_kh, n_st, hash_pw(n_pw), k['id']))
+                    else:
+                        conn.execute("UPDATE kunden SET krankenhaus=?, station=? WHERE id=?", (n_kh, n_st, k['id']))
+                    conn.commit()
+                    st.success("Daten aktualisiert!")
     conn.close()
+
+def zeige_art_anlegen():
+    st.header("➕ Artikel & Mengen-Hierarchie")
+    with st.form("art_logic_form"):
+        c1, c2 = st.columns(2)
+        art_nr = c1.text_input("Artikel-Nummer (REF)")
+        name = c1.text_input("Bezeichnung")
+        platz = c2.text_input("Lagerplatz (z.B. A-01-04)")
+        einh = c2.selectbox("Basiseinheit", ["Stück", "Beutel", "Rolle"])
+        
+        st.divider()
+        st.subheader("📦 Mengen-Definition (Umrechnung)")
+        m1, m2, m3 = st.columns(3)
+        i_pack = m1.number_input("Wieviele Stück sind 1 Pack?", min_value=1, value=10)
+        i_kart = m2.number_input("Wieviele Stück sind 1 Karton?", min_value=1, value=100)
+        i_pale = m3.number_input("Wieviele Stück sind 1 Palette?", min_value=1, value=1000)
+        
+        if st.form_submit_button("Artikel final speichern"):
+            conn = get_connection()
+            try:
+                conn.execute("""INSERT INTO artikel (art_nr, name, lagerplatz, einheit, inhalt_pack, inhalt_karton, inhalt_palette) 
+                             VALUES (?,?,?,?,?,?,?)""", (art_nr, name, platz, einh, i_pack, i_kart, i_pale))
+                conn.commit()
+                st.success(f"Artikel {name} erfolgreich angelegt!")
+            except: st.error("Fehler: Artikelnummer bereits vergeben.")
+            conn.close()
 
 def zeige_lagerbestand():
     st.header("📦 Lagerbestand & Suche")
-    suchbegriff = st.text_input("Suche nach Artikel, Platz oder Nummer...")
-    
+    suchbegriff = st.text_input("Suchen nach Name, Platz oder REF...")
     conn = get_connection()
     df = pd.read_sql_query("SELECT id, art_nr, name, bestand_stk, lagerplatz, einheit, meldebestand_stk FROM artikel", conn)
     
@@ -142,122 +148,57 @@ def zeige_lagerbestand():
             df_display = df[mask]
         else:
             df_display = df
-
         st.dataframe(df_display.drop(columns=['id']), use_container_width=True, hide_index=True)
-        
-        # Stammdaten-Editierung
-        st.divider()
-        st.subheader("✏️ Artikel bearbeiten")
-        art_auswahl = st.selectbox("Artikel zum Editieren wählen", options=df_display['id'].tolist(),
-                                    format_func=lambda x: f"{df_display[df_display['id']==x]['name'].values[0]} ({df_display[df_display['id']==x]['art_nr'].values[0]})")
-        
-        if art_auswahl:
-            art_daten = df[df['id'] == art_auswahl].iloc[0]
-            with st.form(f"edit_form_{art_auswahl}"):
-                c1, c2, c3 = st.columns(3)
-                n_name = c1.text_input("Bezeichnung", value=art_daten['name'])
-                n_platz = c2.text_input("Platz", value=art_daten['lagerplatz'])
-                n_melde = c3.number_input("Meldebestand", value=int(art_daten['meldebestand_stk']))
-                if st.form_submit_button("Änderungen speichern"):
-                    conn.execute("UPDATE artikel SET name=?, lagerplatz=?, meldebestand_stk=? WHERE id=?", 
-                                 (n_name, n_platz, n_melde, art_auswahl))
-                    conn.commit()
-                    st.success("Erfolgreich aktualisiert!")
-                    st.rerun()
-    conn.close()
-
-def zeige_benutzerverwaltung():
-    st.header("🔐 Admin: Benutzerverwaltung")
-    conn = get_connection()
-    t1, t2 = st.tabs(["➕ Neu anlegen", "🗑️ Verwalten/Löschen"])
-    
-    with t1:
-        with st.form("new_user"):
-            u = st.text_input("Username")
-            p = st.text_input("Passwort", type="password")
-            r = st.selectbox("Rolle", list(ROLLEN_DEFAULTS.keys()))
-            if st.form_submit_button("Speichern"):
-                conn.execute("INSERT INTO internal_users (username, passwort_hash, rolle, rechte_json) VALUES (?,?,?,?)",
-                             (u, hash_pw(p), r, json.dumps(ROLLEN_DEFAULTS[r])))
-                conn.commit()
-                st.success(f"Benutzer {u} angelegt!")
-                st.rerun()
-    with t2:
-        users = conn.execute("SELECT id, username, rolle FROM internal_users WHERE username != 'admin'").fetchall()
-        for user in users:
-            col1, col2 = st.columns([4,1])
-            col1.write(f"**{user['username']}** ({user['rolle']})")
-            if col2.button("Löschen", key=f"del_{user['id']}"):
-                conn.execute("DELETE FROM internal_users WHERE id=?", (user['id'],))
-                conn.commit()
-                st.rerun()
     conn.close()
 
 # -------------------------------------------------
-# Main Logic
+# Main Entry Point
 # -------------------------------------------------
 def main():
-    st.set_page_config(page_title="Lager-Steuerung 6.0.1", layout="wide")
+    st.set_page_config(page_title="Lager-System 6.0.2", layout="wide")
     init_db()
 
     if "auth" not in st.session_state: st.session_state.auth = None
 
     if st.session_state.auth is None:
-        tab1, tab2 = st.tabs(["🔐 Mitarbeiter Login", "🏥 Stations-Registrierung"])
+        tab1, tab2 = st.tabs(["🔐 Login", "🏥 Registrierung"])
         with tab1:
             u = st.text_input("User")
             p = st.text_input("Passwort", type="password")
-            if st.button("Einloggen"):
+            if st.button("Anmelden"):
                 conn = get_connection()
                 user = conn.execute("SELECT * FROM internal_users WHERE username=? AND passwort_hash=?", (u, hash_pw(p))).fetchone()
                 if user:
                     st.session_state.auth = dict(user)
-                    set_online_status(user['id'], 1)
                     st.rerun()
-                else: st.error("Zugangsdaten ungültig.")
+                else: st.error("Login fehlgeschlagen")
         with tab2:
             with st.form("reg"):
-                ru = st.text_input("Wunsch-Username")
-                rp = st.text_input("Passwort wählen", type="password")
-                rkh = st.text_input("Krankenhaus Name")
-                rst = st.text_input("Station (z.B. Station 4C)")
+                ru = st.text_input("Username")
+                rp = st.text_input("Passwort", type="password")
+                rkh = st.text_input("Krankenhaus")
+                rst = st.text_input("Station")
                 if st.form_submit_button("Account erstellen"):
                     conn = get_connection()
-                    try:
-                        conn.execute("INSERT INTO kunden (username, passwort_hash, krankenhaus, station) VALUES (?,?,?,?)",
-                                     (ru, hash_pw(rp), rkh, rst))
-                        conn.commit()
-                        st.success("Stations-Account erfolgreich angelegt!")
-                    except: st.error("Dieser Username ist bereits vergeben.")
-                    conn.close()
+                    conn.execute("INSERT INTO kunden (username, passwort_hash, krankenhaus, station) VALUES (?,?,?,?)",
+                                 (ru, hash_pw(rp), rkh, rst))
+                    conn.commit()
+                    st.success("Konto angelegt!")
         return
 
-    # Navigation basierend auf Rechten
     meine_rechte = json.loads(st.session_state.auth['rechte_json'])
     st.sidebar.title(f"User: {st.session_state.auth['username']}")
     erlaubte = [MENU_LABELS[r] for r in meine_rechte if r in MENU_LABELS]
     choice = st.sidebar.radio("Navigation", erlaubte)
 
-    if choice == MENU_LABELS["dashboard"]: zeige_dashboard()
+    if choice == MENU_LABELS["art_anlegen"]: zeige_art_anlegen()
     elif choice == MENU_LABELS["lagerbestand"]: zeige_lagerbestand()
-    elif choice == MENU_LABELS["benutzerverwaltung"]: zeige_benutzerverwaltung()
-    elif choice == MENU_LABELS["art_anlegen"]: 
-        st.header("➕ Artikelstammdaten anlegen")
-        with st.form("add"):
-            c1, c2 = st.columns(2)
-            art_nr = c1.text_input("Artikel-Nummer (REF)")
-            name = c1.text_input("Bezeichnung")
-            platz = c2.text_input("Lagerplatz")
-            einh = c2.selectbox("Einheit", ["Stück", "Pack", "Karton", "Palette"])
-            if st.form_submit_button("Speichern"):
-                conn = get_connection()
-                conn.execute("INSERT INTO artikel (art_nr, name, lagerplatz, einheit) VALUES (?,?,?,?)", (art_nr, name, platz, einh))
-                conn.commit()
-                conn.close()
-                st.success("Artikel wurde im System registriert!")
+    elif choice == MENU_LABELS["kundenverwaltung"]: zeige_kundenverwaltung()
+    elif choice == MENU_LABELS["dashboard"]: st.info("Monitor-Ansicht (V6.0.1)")
+    elif choice == MENU_LABELS["scanner"]: st.info("Scanner aktiv")
+    elif choice == MENU_LABELS["picking"]: st.info("Picking aktiv")
 
     if st.sidebar.button("Abmelden"):
-        set_online_status(st.session_state.auth['id'], 0)
         st.session_state.auth = None
         st.rerun()
 
