@@ -1,17 +1,3 @@
-Hier ist die konsolidierte **Version 6.0**. Diese Version fasst alle Entwicklungsschritte seit V3.0 zusammen und enthält die vollständige Logik für das Krankenhaus-Lager (Stammdaten, Suche, Bearbeitung, Admin-Tools, Ampel-Monitoring, Lieferscheine mit Logo und Bestandsrevision).
-
-### Wichtigste Neuerungen in V6.0:
-* **Stammdaten-Pflege:** Artikel können im Lagerbestand direkt bearbeitet werden (Lagerplatz, Name, Meldebestand).
-* **Dynamische Suche:** Echtzeit-Filterung im Lagerbestand nach Name, Platz oder EAN.
-* **Admin-Center:** Vollständige Benutzerverwaltung (Anlegen/Löschen) und Online-Monitor.
-* **Kunden-Portal:** Registrierung mit Krankenhaus-spezifischen Daten, Username und Passwort.
-* **Sicherheits-Revision:** Automatische Rückbuchung zum Lagerbestand bei Lieferschein-Korrekturen.
-
----
-
-### Der vollständige Code (V6.0 - Copy & Paste)
-
-```python
 import hashlib
 import io
 import json
